@@ -71,7 +71,3 @@ To set this up, create a free project at [supabase.com](https://supabase.com) an
 - Free-tier rate limits are real and vary by provider — see each provider's own dashboard for current limits.
 - "Premium" is a placeholder (see above).
 - No cross-device sync of chats or keys.
-
-## License
-
-No license file is included yet — add one (MIT is a common choice for a project like this) before treating this as open source.
