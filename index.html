@@ -1,0 +1,2935 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Multiplex Chat</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #121316; }
+  #root { height: 100vh; }
+  #load-error { display:none; font-family: monospace; white-space: pre-wrap; color: #E27C7C; background:#1E2128; padding:20px; margin:20px; border-radius:8px; border:1px solid #3A2C2C; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<pre id="load-error"></pre>
+<script>
+  // Surface any load/runtime error visibly instead of leaving a blank page.
+  window.addEventListener("error", function (e) {
+    var box = document.getElementById("load-error");
+    if (!box) return;
+    box.style.display = "block";
+    box.textContent += "Error: " + (e.message || e.error) + (e.filename ? "\n  at " + e.filename + ":" + e.lineno : "") + "\n";
+  });
+  window.addEventListener("DOMContentLoaded", function () {
+    setTimeout(function () {
+      if (typeof React === "undefined" || typeof ReactDOM === "undefined" || typeof Babel === "undefined") {
+        var box = document.getElementById("load-error");
+        box.style.display = "block";
+        box.textContent += "One or more CDN scripts failed to load (React/ReactDOM/Babel). This usually means the browser has no internet access or a network/ad blocker is blocking cdnjs.cloudflare.com.\n";
+      }
+      if (typeof supabase === "undefined") {
+        var box2 = document.getElementById("load-error");
+        box2.style.display = "block";
+        box2.textContent += "The Supabase SDK failed to load (blocked cdn.jsdelivr.net?) — sign-in won't work until this loads.\n";
+      }
+    }, 3000);
+  });
+</script>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useMemo } = React;
+
+
+// maxTokens is a per-provider CEILING, not a fixed length — estimateAutoMaxTokens computes the actual per-message budget and clamps to this. Lower it per-provider in Settings on a "context length exceeded" error.
+const PROVIDER_DEFAULTS = {
+  google: {
+    label: "Google AI Studio",
+    apiKey: "",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    defaultModel: "gemini-3.6-flash",
+    maxTokens: 4096,
+    color: "#5B8DEF",
+    keyUrl: "https://aistudio.google.com/apikey",
+    keyPlaceholder: "AIzaSy...",
+  },
+  groq: {
+    label: "Groq",
+    apiKey: "",
+    baseUrl: "https://api.groq.com/openai/v1",
+    defaultModel: "openai/gpt-oss-120b",
+    maxTokens: 4096,
+    color: "#B18AFF",
+    keyUrl: "https://console.groq.com/keys",
+    keyPlaceholder: "gsk_...",
+  },
+  openrouter: {
+    label: "OpenRouter",
+    apiKey: "",
+    baseUrl: "https://openrouter.ai/api/v1",
+    // Must end in ":free" to actually be free — OpenRouter's free-tier limits only apply to that suffix; everything else bills per-token with no free allowance.
+    defaultModel: "nvidia/nemotron-3-super-120b-a12b:free",
+    maxTokens: 4096,
+    color: "#3FC7A8",
+    keyUrl: "https://openrouter.ai/keys",
+    keyPlaceholder: "sk-or-v1-...",
+  },
+  mistral: {
+    label: "Mistral AI",
+    apiKey: "",
+    baseUrl: "https://api.mistral.ai/v1",
+    defaultModel: "mistral-large-latest",
+    maxTokens: 4096,
+    color: "#E8577A",
+    keyUrl: "https://console.mistral.ai/api-keys",
+    keyPlaceholder: "Paste API key",
+  },
+  cloudflare: {
+    label: "Cloudflare Workers AI",
+    apiKey: "",
+    // Cloudflare bakes your account ID into the endpoint path — replace YOUR_ACCOUNT_ID below with the ID from your Cloudflare dashboard sidebar before this provider will work.
+    baseUrl: "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1",
+    defaultModel: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    maxTokens: 4096,
+    color: "#F6821F",
+    keyUrl: "https://dash.cloudflare.com/profile/api-tokens",
+    keyPlaceholder: "Cloudflare API token (Workers AI permission)",
+  },
+};
+
+const ACCENT = "#D9A441";
+const TEXT_FILE_EXT = /\.(txt|md|csv|json|js|jsx|ts|tsx|py|html|css|log)$/i;
+const HISTORY_KEY = "multiplex_chat_history_v1";
+const HISTORY_LIMIT = 30;
+const PROVIDERS_KEY = "multiplex_providers_v1";
+const VOICE_KEY = "multiplex_voice_uri_v1";
+const SUPABASE_CONFIG_KEY = "multiplex_supabase_config_v1";
+const SIDEBAR_WIDTH_KEY = "multiplex_sidebar_width_v1";
+const SIDEBAR_MIN = 64; // icon-only collapsed width
+const SIDEBAR_COLLAPSE_AT = 150; // drag below this and labels hide, snapping visually to icon-only
+const SIDEBAR_MAX = 340;
+const SIDEBAR_DEFAULT = 230;
+const TERMS_KEY = "multiplex_terms_accepted_v1";
+
+// Shared UI-chrome palette (distinct from PROVIDER_DEFAULTS' per-provider brand colors) — one place to change the app's look instead of ~140 scattered literals.
+const BG = "#121316"; // page / input background
+const PANEL_BG = "#181B21"; // card, dropdown, and modal background
+const PANEL_BG_ALT = "#1E2128"; // hovered/alternate panel background, chips
+const BORDER_COLOR = "#2C2F38"; // default border hex, for the few spots that need just the color
+const BORDER = "1px solid " + BORDER_COLOR; // the "border: 1px solid X" shorthand, reused verbatim ~17 times
+const BORDER_HOVER = "#3A3D48"; // border color on hover
+const DIVIDER_COLOR = "#22242B"; // subtler divider/separator hex
+const DIVIDER = "1px solid " + DIVIDER_COLOR; // divider shorthand, reused ~7 times
+const TEXT_PRIMARY = "#F3F2ED";
+const TEXT_SECONDARY = "#D8D9DE";
+const TEXT_SOFT = "#B5B7C0";
+const TEXT_DIM = "#9A9CA6";
+const TEXT_MUTED = "#6B6E78";
+const TEXT_MUTED2 = "#8C8E97";
+const TEXT_FAINT = "#7C7F89";
+const TEXT_FAINTEST = "#4A4C54";
+const ERROR = "#E27C7C";
+const WARNING = "#E0A83D";
+const SUCCESS = "#3FC77A";
+const CODE_BORDER = "1px solid #2A2D36"; // border shorthand specific to code blocks, distinct from the rest of the UI's BORDER shade
+
+// Shared Settings-modal field label/input look; must stay after the color constants it references.
+const FIELD_LABEL_STYLE = { fontSize: "11px", color: TEXT_MUTED, textTransform: "uppercase", letterSpacing: "0.04em" };
+const FIELD_INPUT_STYLE = { width: "100%", border: BORDER, background: BG, color: TEXT_PRIMARY, borderRadius: "8px", padding: "8px 11px", fontSize: "13px", marginTop: "4px", fontFamily: "inherit" };
+
+function loadStoredProviders() {
+  try {
+    const raw = localStorage.getItem(PROVIDERS_KEY);
+    const saved = raw ? JSON.parse(raw) : {};
+    const merged = {};
+    Object.keys(PROVIDER_DEFAULTS).forEach((key) => {
+      merged[key] = { ...PROVIDER_DEFAULTS[key], ...(saved[key] || {}) };
+    });
+    return merged;
+  } catch (e) {
+    return PROVIDER_DEFAULTS;
+  }
+}
+
+function saveProviders(providers) {
+  // Storage can fail (quota, private browsing) — settings just won't persist this time.
+  safely(() => localStorage.setItem(PROVIDERS_KEY, JSON.stringify(providers)));
+}
+
+// The anon/public key is meant to be embedded in client code — Supabase's
+// security model relies on Row Level Security policies on the project
+// itself, not on keeping this key secret. Both fields are typed in by
+// whoever runs this file, same as every provider API key above; nothing is
+// hardcoded here.
+function loadSupabaseConfig() {
+  try {
+    const raw = localStorage.getItem(SUPABASE_CONFIG_KEY);
+    const saved = raw ? JSON.parse(raw) : {};
+    return { url: saved.url || "", anonKey: saved.anonKey || "" };
+  } catch (e) {
+    return { url: "", anonKey: "" };
+  }
+}
+
+function saveSupabaseConfig(cfg) {
+  safely(() => localStorage.setItem(SUPABASE_CONFIG_KEY, JSON.stringify(cfg)));
+}
+
+function uid() {
+  return Math.random().toString(36).slice(2, 9);
+}
+
+// Runs fn and swallows any error, returning fallback instead — for the
+// handful of best-effort calls here (storage writes that can throw in
+// private browsing, disconnecting/closing an already-torn-down audio or
+// WebSocket resource) where failure is expected and safe to ignore.
+function safely(fn, fallback) {
+  try {
+    return fn();
+  } catch (e) {
+    return fallback;
+  }
+}
+
+// Shared by every dropdown: closes on outside mousedown. Pass the setState function itself (stable identity) so the listener attaches once, not per render.
+function useClickOutside(setOpen) {
+  const ref = useRef(null);
+  useEffect(() => {
+    function handleClick(e) {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [setOpen]);
+  return ref;
+}
+
+function loadHistoryList() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveHistoryList(list) {
+  // Storage can fail (quota, private browsing) — history just won't persist this time.
+  safely(() => localStorage.setItem(HISTORY_KEY, JSON.stringify(list)));
+}
+
+// Attachments (esp. images) can be large; keep them out of saved history so browser storage doesn't fill up — only text/role matter for recall.
+function stripAttachmentsForHistory(conversations) {
+  const out = {};
+  Object.keys(conversations).forEach((colId) => {
+    out[colId] = (conversations[colId] || []).map((m) => ({ role: m.role, content: m.content, id: m.id }));
+  });
+  return out;
+}
+
+function makeHistoryTitle(conversations) {
+  for (const colId of Object.keys(conversations)) {
+    const firstUser = (conversations[colId] || []).find((m) => m.role === "user" && m.content);
+    if (firstUser) return firstUser.content.slice(0, 48);
+  }
+  return "New conversation";
+}
+
+function formatRelativeTime(ts) {
+  const diffMs = Date.now() - ts;
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return mins + "m ago";
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + "h ago";
+  const days = Math.floor(hrs / 24);
+  return days + "d ago";
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(new Error("Could not read file"));
+    r.readAsDataURL(file);
+  });
+}
+
+function fileToText(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(new Error("Could not read file"));
+    r.readAsText(file);
+  });
+}
+
+async function readSSE(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  function emitPart(part) {
+    const lines = part.split("\n");
+    let data = "";
+    for (const line of lines) {
+      if (line.startsWith("data:")) data += line.slice(5).trim();
+    }
+    if (data) onEvent(data);
+  }
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop();
+    parts.forEach(emitPart);
+  }
+  // Flush any bytes buffered in the decoder and process a final event even without a trailing blank line, so the last chunk isn't silently lost.
+  buffer += decoder.decode();
+  if (buffer.trim()) emitPart(buffer);
+}
+
+// "none" = no built-in search regardless of the toggle; "auto" = the model decides on its own; "native" = we add a provider-specific flag to request it.
+function getWebSearchMode(providerKey, model) {
+  const m = (model || "").toLowerCase();
+  if (providerKey === "google") return "native"; // tools: [{ google_search: {} }]
+  if (providerKey === "openrouter") return "native"; // plugins: [{ id: "web" }] — works for any model routed through OpenRouter
+  if (providerKey === "groq") {
+    if (/^groq\/compound/.test(m)) return "auto"; // Compound systems search automatically when useful
+    if (/^openai\/gpt-oss-(20b|120b)\b/.test(m)) return "native"; // tools: [{ type: "browser_search" }]
+    return "none";
+  }
+  return "none"; // Mistral, Cloudflare: no request-level web search on the chat completions endpoint these use
+}
+
+function buildOpenAIMessages(history) {
+  return history
+    .filter((m) => m.content || (m.attachments && m.attachments.length))
+    .map((m) => {
+      const blocks = [];
+      if (m.content) blocks.push({ type: "text", text: m.content });
+      (m.attachments || []).forEach((a) => {
+        if (a.kind === "image") {
+          blocks.push({ type: "image_url", image_url: { url: a.dataUrl } });
+        } else if (a.kind === "text") {
+          blocks.push({ type: "text", text: "File " + a.name + ":\n" + a.text });
+        }
+      });
+      return { role: m.role, content: blocks };
+    });
+}
+
+function buildGoogleContents(history) {
+  return history
+    .filter((m) => m.content || (m.attachments && m.attachments.length))
+    .map((m) => {
+      const parts = [];
+      if (m.content) parts.push({ text: m.content });
+      (m.attachments || []).forEach((a) => {
+        if (a.kind === "image") {
+          parts.push({ inlineData: { mimeType: a.mimeType, data: a.base64 } });
+        } else if (a.kind === "text") {
+          parts.push({ text: "File " + a.name + ":\n" + a.text });
+        }
+      });
+      return { role: m.role === "assistant" ? "model" : "user", parts };
+    });
+}
+
+async function streamGoogle(cfg, history, onDelta, onSources, signal, webSearch) {
+  // Auth via x-goog-api-key header, not ?key= query param — Google's newer "Auth" key format (AQ....) has been reported failing as a query param; the header works for both old and new key formats.
+  const url = cfg.baseUrl + "/models/" + cfg.model + ":streamGenerateContent?alt=sse";
+  // thinkingBudget:0 disables Gemini's internal reasoning pass — without it, thinking tokens can silently eat the whole maxOutputTokens budget before any visible reply appears, looking like the UI hanging with no error.
+  const body = {
+    contents: buildGoogleContents(history),
+    generationConfig: { maxOutputTokens: cfg.maxTokens || 1024, thinkingConfig: { thinkingBudget: 0 } },
+  };
+  if (webSearch) body.tools = [{ google_search: {} }];
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-goog-api-key": cfg.apiKey },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok) {
+    throw new Error("Google error " + res.status + ": " + (await readErrorText(res)) + friendlyStatusHint(res.status, "Google"));
+  }
+  let gotText = false;
+  let blockReason = null;
+  await readSSE(res, (data) => {
+    try {
+      const json = JSON.parse(data);
+      if (json.promptFeedback && json.promptFeedback.blockReason) blockReason = json.promptFeedback.blockReason;
+      const cand = json.candidates && json.candidates[0];
+      const parts = cand && cand.content && cand.content.parts;
+      if (parts) parts.forEach((p) => { if (p.text) { gotText = true; onDelta(p.text); } });
+      // Grounding metadata carries the pages Search Grounding actually used — surface them as source links under the reply.
+      const gm = cand && cand.groundingMetadata;
+      const chunks = gm && gm.groundingChunks;
+      if (chunks && chunks.length) {
+        const sources = chunks.map((c) => c.web && { title: c.web.title, url: c.web.uri }).filter(Boolean);
+        if (sources.length) onSources(sources);
+      }
+    } catch (e) {}
+  });
+  // Surface a clear, actionable error instead of silently finishing with an empty bubble (which just looks like the app is stuck).
+  if (!gotText) {
+    if (blockReason) throw new Error("Google blocked this prompt (" + blockReason + "). Try rephrasing it.");
+    throw new Error("Google returned an empty response. Try raising \"Max reply length cap\" for Google in Settings, or rephrase the message.");
+  }
+}
+
+// Sizes the reply token budget from the message instead of a fixed value — short asks get a small budget, longer/complex ones get room to finish. Still clamped to the per-provider ceiling in Settings.
+function estimateAutoMaxTokens(text, attachments) {
+  const t = (text || "").trim();
+  const words = t ? t.split(/\s+/).length : 0;
+  const questionMarks = (t.match(/\?/g) || []).length;
+  const hasCode = /```|\bfunction\b|\bclass\s+\w|\bdef \b|\bimport \b|<html|SELECT\s+.+\bFROM\b|for\s*\(|while\s*\(/i.test(t);
+  const complexSignal =
+    /\b(explain|elaborate|detail(ed)?|comprehensive|in[- ]depth|thorough|essay|article|report|analy[sz]e|analysis|compare|comparison|summar(y|ize)|step[- ]by[- ]step|walkthrough|tutorial|write (a|an|me) (a )?(story|essay|article|report|program|script|function|guide|plan|poem)|pros and cons|research|outline|breakdown|deep dive|full (code|implementation))\b/i.test(
+      t
+    );
+  const hasAttachments = !!(attachments && attachments.length);
+
+  let tokens;
+  if (words <= 6 && !hasAttachments) tokens = 256; // e.g. "hi", "what's the capital of France?"
+  else if (words <= 20) tokens = 700;
+  else if (words <= 60) tokens = 1600;
+  else tokens = 3200;
+
+  if (complexSignal || hasCode) tokens = Math.max(tokens, 3200);
+  if (questionMarks >= 3) tokens = Math.max(tokens, 2000);
+  if (hasAttachments) tokens = Math.max(tokens, 2000);
+  if (words > 150) tokens = Math.max(tokens, 6000);
+
+  return Math.min(tokens, 8192);
+}
+
+function isChatCompletionModel(id) {
+  return !/guard|whisper|tts|text-to-speech|embed|moderation|rerank/i.test(id);
+}
+
+async function streamOpenAICompatible(cfg, history, onDelta, onSources, extraHeaders, signal, providerKey, webSearch) {
+  const body = { model: cfg.model, stream: true, max_tokens: cfg.maxTokens || 1024, messages: buildOpenAIMessages(history) };
+  if (webSearch) {
+    const mode = getWebSearchMode(providerKey, cfg.model);
+    if (providerKey === "openrouter") {
+      // Works for any model routed through OpenRouter — uses the model's native search when available, Exa otherwise.
+      body.plugins = [{ id: "web" }];
+    } else if (providerKey === "groq" && mode === "native") {
+      // Groq's browser_search built-in tool, only wired up for the GPT-OSS models.
+      body.tools = [{ type: "browser_search" }];
+    }
+      // Groq's browser_search built-in tool, only wired up for the GPT-OSS models.
+  }
+  const res = await fetch(cfg.baseUrl + "/chat/completions", {
+    method: "POST",
+    headers: Object.assign(
+      { "content-type": "application/json", authorization: "Bearer " + cfg.apiKey },
+      extraHeaders || {}
+    ),
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok) {
+    throw new Error("Request error " + res.status + ": " + (await readErrorText(res)) + friendlyStatusHint(res.status, PROVIDER_DEFAULTS[providerKey].label));
+  }
+  await readSSE(res, (data) => {
+    if (data === "[DONE]") return;
+    try {
+      const json = JSON.parse(data);
+      const delta = json.choices && json.choices[0] && json.choices[0].delta;
+      if (delta && delta.content) onDelta(delta.content);
+      // OpenRouter (and any provider following the same schema) attaches url_citation annotations to the delta as search results come in.
+      const annotations = delta && delta.annotations;
+      if (annotations && annotations.length) {
+        const sources = annotations
+          .filter((a) => a.type === "url_citation" && a.url_citation && a.url_citation.url)
+          .map((a) => ({ title: a.url_citation.title || a.url_citation.url, url: a.url_citation.url }));
+        if (sources.length) onSources(sources);
+      }
+    } catch (e) {}
+  });
+}
+
+async function runProvider(provider, cfg, history, onDelta, onSources, signal, webSearch) {
+  if (provider === "google") return streamGoogle(cfg, history, onDelta, onSources, signal, webSearch);
+  if (provider === "openrouter")
+    return streamOpenAICompatible(cfg, history, onDelta, onSources, { "HTTP-Referer": "https://claude.ai", "X-Title": "Multiplex" }, signal, provider, webSearch);
+  return streamOpenAICompatible(cfg, history, onDelta, onSources, undefined, signal, provider, webSearch);
+}
+
+// ---- Image generation: each provider's API has a different shape (chat-embedded, dedicated REST, binary bytes, or async poll) — no-image providers get an empty IMAGE_MODELS list, disabling image mode for that column.
+const IMAGE_MODELS = {
+  google: [
+    { id: "gemini-2.5-flash-image", label: "Gemini 2.5 Flash Image (Nano Banana)" },
+    { id: "gemini-3.1-flash-image", label: "Gemini 3.1 Flash Image (Nano Banana 2)" },
+    { id: "gemini-3-pro-image", label: "Gemini 3 Pro Image (Nano Banana Pro)" },
+  ],
+  openrouter: [
+    { id: "google/gemini-2.5-flash-image", label: "Nano Banana (Gemini 2.5 Flash Image)" },
+    { id: "google/gemini-3.1-flash-image", label: "Nano Banana 2 (Gemini 3.1 Flash Image)" },
+    { id: "bytedance-seed/seedream-4.5", label: "Seedream 4.5" },
+    { id: "black-forest-labs/flux.2-pro", label: "FLUX.2 Pro" },
+    { id: "openai/gpt-image-2", label: "GPT Image 2" },
+  ],
+  groq: [],
+  mistral: [],
+  cloudflare: [
+    { id: "@cf/black-forest-labs/flux-1-schnell", label: "FLUX.1 [schnell]" },
+    { id: "@cf/stabilityai/stable-diffusion-xl-base-1.0", label: "Stable Diffusion XL" },
+    { id: "@cf/bytedance/stable-diffusion-xl-lightning", label: "SDXL Lightning" },
+  ],
+};
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+// Provider error bodies are almost always JSON with the real message nested inside — pull that out instead of dumping raw, truncated JSON at the user.
+function extractErrorMessage(rawText) {
+  try {
+    const json = JSON.parse(rawText);
+    const err = json.error;
+    if (typeof err === "string" && err) return err;
+    if (err && typeof err.message === "string" && err.message) return err.message;
+    if (typeof json.message === "string" && json.message) return json.message;
+  } catch (e) {}
+  return rawText;
+}
+
+// 429 is the most common first-message failure for free-tier keys — surface why, not just the status code.
+function friendlyStatusHint(status, providerLabel) {
+  if (status === 429) {
+    return (
+      " — this is " +
+      providerLabel +
+      "'s own rate/usage limit, not something wrong in the app. Free tiers often give 0 quota to bigger or preview models " +
+      "(try a smaller/base model), or you may be briefly over a per-minute cap (wait ~60s and retry), or the key's project may need billing enabled. " +
+      "Check the provider's usage/quota page in Settings (the key link) for specifics."
+    );
+  }
+  if (status === 401 || status === 403) {
+    return " — check the API key in Settings; it may be missing, wrong, expired, or lack permission for this model.";
+  }
+  return "";
+}
+
+async function readErrorText(res) {
+  try {
+    return extractErrorMessage(await res.text()).slice(0, 260);
+  } catch (e) {
+    return String(res.status);
+  }
+}
+
+// Google: chat-style models (Nano Banana family) share the generateContent endpoint with text, just requesting an IMAGE modality; imagen-* models use the separate :predict endpoint.
+async function generateImageGoogle(cfg, prompt, signal) {
+  if (/^imagen/i.test(cfg.model)) {
+    const url = cfg.baseUrl + "/models/" + cfg.model + ":predict";
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": cfg.apiKey },
+      body: JSON.stringify({ instances: [{ prompt }], parameters: { sampleCount: 1 } }),
+      signal,
+    });
+    if (!res.ok) throw new Error("Google Imagen error " + res.status + ": " + (await readErrorText(res)));
+    const json = await res.json();
+    const images = (json.predictions || []).map((p) => p.bytesBase64Encoded && "data:image/png;base64," + p.bytesBase64Encoded).filter(Boolean);
+    if (!images.length) throw new Error("Imagen returned no image data.");
+    return images;
+  }
+  const url = cfg.baseUrl + "/models/" + cfg.model + ":generateContent";
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-goog-api-key": cfg.apiKey },
+    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { responseModalities: ["TEXT", "IMAGE"] } }),
+    signal,
+  });
+  if (!res.ok) throw new Error("Google error " + res.status + ": " + (await readErrorText(res)));
+  const json = await res.json();
+  const parts = (json.candidates && json.candidates[0] && json.candidates[0].content && json.candidates[0].content.parts) || [];
+  const images = parts.filter((p) => p.inlineData).map((p) => "data:" + p.inlineData.mimeType + ";base64," + p.inlineData.data);
+  if (!images.length) throw new Error("The model replied without an image — try a more explicit image prompt.");
+  return images;
+}
+
+// OpenRouter: dedicated /api/v1/images endpoint, one consistent request/response shape across its whole image-model catalog.
+async function generateImageOpenRouter(cfg, prompt, signal) {
+  const res = await fetch("https://openrouter.ai/api/v1/images", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer " + cfg.apiKey, "HTTP-Referer": "https://claude.ai", "X-Title": "Multiplex" },
+    body: JSON.stringify({ model: cfg.model, prompt }),
+    signal,
+  });
+  if (!res.ok) throw new Error("OpenRouter image error " + res.status + ": " + (await readErrorText(res)));
+  const json = await res.json();
+  const images = (json.data || []).map((d) => d.b64_json && "data:" + (d.media_type || "image/png") + ";base64," + d.b64_json).filter(Boolean);
+  if (!images.length) throw new Error("OpenRouter returned no image data.");
+  return images;
+}
+
+// Cloudflare image models live behind the native /accounts/{id}/ai/run/{model} endpoint, not /ai/v1 — replies come back as either raw PNG bytes or JSON with a base64 field, so both are handled.
+async function generateImageCloudflare(cfg, prompt, signal) {
+  const runBase = cfg.baseUrl.replace(/\/ai\/v1\/?$/, "/ai/run");
+  if (runBase === cfg.baseUrl) {
+    throw new Error("Couldn't derive the Cloudflare Workers AI run endpoint — check the base URL in Settings ends in /ai/v1.");
+  }
+  const res = await fetch(runBase + "/" + cfg.model, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer " + cfg.apiKey },
+    body: JSON.stringify({ prompt }),
+    signal,
+  });
+  if (!res.ok) throw new Error("Cloudflare image error " + res.status + ": " + (await readErrorText(res)));
+  const contentType = res.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    const json = await res.json();
+    const b64 = json.result && (json.result.image || (Array.isArray(json.result.images) && json.result.images[0]));
+    if (!b64) throw new Error("Cloudflare returned no image data.");
+    return ["data:image/png;base64," + b64];
+  }
+  const blob = await res.blob();
+  return [await blobToDataUrl(blob)];
+}
+
+async function generateImage(provider, cfg, prompt, signal) {
+  if (provider === "google") return generateImageGoogle(cfg, prompt, signal);
+  if (provider === "openrouter") return generateImageOpenRouter(cfg, prompt, signal);
+  if (provider === "cloudflare") return generateImageCloudflare(cfg, prompt, signal);
+  throw new Error(PROVIDER_DEFAULTS[provider].label + " doesn't offer image generation.");
+}
+
+async function fetchModelsForProvider(providerKey, cfg) {
+  if (providerKey === "google") {
+    const res = await fetch(cfg.baseUrl + "/models", { headers: { "x-goog-api-key": cfg.apiKey } });
+    if (!res.ok) throw new Error("Could not load models (" + res.status + ")");
+    const json = await res.json();
+    return (json.models || [])
+      .filter((m) => !m.supportedGenerationMethods || m.supportedGenerationMethods.includes("generateContent"))
+      .map((m) => {
+        const id = m.name.replace(/^models\//, "");
+        return { id, label: m.displayName || id };
+      });
+  }
+  if (providerKey === "openrouter") {
+    const res = await fetch(cfg.baseUrl + "/models");
+    if (!res.ok) throw new Error("Could not load models (" + res.status + ")");
+    const json = await res.json();
+    return (json.data || []).filter((m) => isChatCompletionModel(m.id)).map((m) => ({ id: m.id, label: m.name || m.id }));
+  }
+  const res = await fetch(cfg.baseUrl + "/models", { headers: { authorization: "Bearer " + cfg.apiKey } });
+  if (!res.ok) throw new Error("Could not load models (" + res.status + ")");
+  const json = await res.json();
+  return (json.data || []).filter((m) => isChatCompletionModel(m.id)).map((m) => ({ id: m.id, label: m.id }));
+}
+
+function speak(text, onError, cancelQueue, voiceURI) {
+  try {
+    if (!("speechSynthesis" in window)) {
+      if (onError) onError("Speech synthesis isn't supported in this browser.");
+      return;
+    }
+    // Only clear the queue when explicitly asked (stop / voice off) — parallel columns finishing close together should queue, not cut each other off.
+    if (cancelQueue) window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    // Chromium has a long-standing bug where speech silently cuts out after ~15s unless nudged with pause/resume.
+    const keepAlive = setInterval(() => {
+      if (!window.speechSynthesis.speaking) {
+        clearInterval(keepAlive);
+        return;
+      }
+      window.speechSynthesis.pause();
+      window.speechSynthesis.resume();
+    }, 9000);
+    u.onend = () => clearInterval(keepAlive);
+    u.onerror = (e) => {
+      clearInterval(keepAlive);
+      // "interrupted"/"canceled" fire whenever a newer utterance preempts this one (e.g. voice toggled off) — expected, not a failure.
+      if (onError && e.error !== "interrupted" && e.error !== "canceled") {
+        onError("Couldn't play speech (" + (e.error || "unknown error") + ").");
+      }
+    };
+    // Chrome loads voices asynchronously; speaking before they're ready can silently produce no audio, so wait for the list once if it's empty.
+    const voices = window.speechSynthesis.getVoices();
+    function applyVoice(list) {
+      if (voiceURI) {
+        const match = list.find((v) => v.voiceURI === voiceURI);
+        if (match) u.voice = match;
+      }
+    }
+    if (voices.length === 0) {
+      let spoken = false;
+      const fire = () => {
+        if (spoken) return;
+        spoken = true;
+        window.speechSynthesis.removeEventListener("voiceschanged", fire);
+        applyVoice(window.speechSynthesis.getVoices());
+        window.speechSynthesis.speak(u);
+      };
+      window.speechSynthesis.addEventListener("voiceschanged", fire);
+      // Fallback in case the event never fires on this browser.
+      setTimeout(fire, 300);
+    } else {
+      applyVoice(voices);
+      window.speechSynthesis.speak(u);
+    }
+  } catch (e) {
+    if (onError) onError(e.message || "Speech synthesis failed.");
+  }
+}
+
+function splitBlocks(text) {
+  const blocks = [];
+  const regex = /```([a-zA-Z0-9]*)\n?([\s\S]*?)```/g;
+  let lastIndex = 0;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) blocks.push({ type: "text", value: text.slice(lastIndex, match.index) });
+    blocks.push({ type: "code", lang: match[1], value: match[2] });
+    lastIndex = regex.lastIndex;
+  }
+  if (lastIndex < text.length) blocks.push({ type: "text", value: text.slice(lastIndex) });
+  return blocks;
+}
+
+function parseInline(line, keyPrefix) {
+  const nodes = [];
+  // Markdown links are included so inline web-search citations (e.g. OpenRouter's web plugin output) render as real links instead of raw bracket/paren text.
+  const regex = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\(https?:\/\/[^\s)]+\))/g;
+  let last = 0;
+  let m;
+  let key = 0;
+  while ((m = regex.exec(line)) !== null) {
+    if (m.index > last) nodes.push(line.slice(last, m.index));
+    const token = m[0];
+    if (token.startsWith("`")) {
+      nodes.push(
+        <code key={keyPrefix + "-" + key++} style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: "13px", background: "rgba(255,255,255,0.08)", padding: "1px 5px", borderRadius: "4px" }}>
+          {token.slice(1, -1)}
+        </code>
+      );
+    } else if (token.startsWith("[")) {
+      const linkMatch = token.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+      nodes.push(
+        <a
+          key={keyPrefix + "-" + key++}
+          href={linkMatch[2]}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ color: ACCENT, textDecoration: "underline", textUnderlineOffset: "2px" }}
+        >
+          {linkMatch[1]}
+        </a>
+      );
+    } else {
+      nodes.push(
+        <strong key={keyPrefix + "-" + key++} style={{ fontWeight: 600 }}>
+          {token.slice(2, -2)}
+        </strong>
+      );
+    }
+    last = regex.lastIndex;
+  }
+  if (last < line.length) nodes.push(line.slice(last));
+  return nodes;
+}
+
+function CodeBlock({ lang, code }) {
+  const [copied, setCopied] = useState(false);
+  function handleCopy() {
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(code);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1400);
+    }
+  }
+  return (
+    <div style={{ margin: "8px 0", borderRadius: "10px", overflow: "hidden", border: CODE_BORDER, background: "#0E1013" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 12px", background: PANEL_BG, borderBottom: CODE_BORDER }}>
+        <span style={{ fontSize: "11px", color: TEXT_FAINT, fontFamily: "'JetBrains Mono', monospace" }}>{lang || "text"}</span>
+        <button className="ghost-btn" onClick={handleCopy} style={{ fontSize: "11px", padding: "3px 8px" }}>
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <pre style={{ margin: 0, padding: "12px 14px", overflowX: "auto" }}>
+        <code style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: "13px", color: "#E4E3DD", lineHeight: 1.6 }}>{code}</code>
+      </pre>
+    </div>
+  );
+}
+
+function MessageContent({ text }) {
+  if (!text) return null;
+  const blocks = splitBlocks(text);
+  return (
+    <div>
+      {blocks.map((b, i) =>
+        b.type === "code" ? (
+          <CodeBlock key={i} lang={b.lang} code={b.value.replace(/\n$/, "")} />
+        ) : (
+          b.value.split("\n").map((line, j) => {
+            const isBullet = /^\s*[-*]\s+/.test(line);
+            const content = isBullet ? line.replace(/^\s*[-*]\s+/, "") : line;
+            return (
+              <div key={i + "-" + j} style={{ paddingLeft: isBullet ? "16px" : 0, position: "relative", minHeight: line === "" ? "10px" : "auto" }}>
+                {isBullet && <span style={{ position: "absolute", left: 0, color: TEXT_FAINT }}>–</span>}
+                {parseInline(content, i + "-" + j)}
+              </div>
+            );
+          })
+        )
+      )}
+    </div>
+  );
+}
+
+function Avatar({ color, label }) {
+  return (
+    <div style={{ width: "22px", height: "22px", borderRadius: "50%", background: color, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "10px", fontWeight: 700, color: "#0B0C0F" }}>
+      {label.slice(0, 1)}
+    </div>
+  );
+}
+
+// A full-width, icon + label row for the sidebar (nav links, quick actions).
+// `active` gives it the same persistent accent highlight the old compact rail buttons used;
+// otherwise it just gets a hover state from the .nav-item class below.
+function NavItem({ icon, label, onClick, active, collapsed }) {
+  return (
+    <button
+      onClick={onClick}
+      className="nav-item"
+      title={collapsed ? label : undefined}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: collapsed ? "center" : "flex-start",
+        gap: "10px",
+        width: "100%",
+        textAlign: "left",
+        border: "none",
+        borderRadius: "8px",
+        padding: collapsed ? "8px" : "8px 10px",
+        cursor: "pointer",
+        background: active ? "rgba(217,164,65,0.12)" : "transparent",
+        color: active ? ACCENT : TEXT_SECONDARY,
+        fontSize: "13.5px",
+        fontWeight: active ? 600 : 500,
+        fontFamily: "inherit",
+      }}
+    >
+      <span style={{ display: "flex", flexShrink: 0 }}>{icon}</span>
+      {!collapsed && label}
+    </button>
+  );
+}
+
+function ProviderKeyCard({ providerKey, def, savedKey, onSave }) {
+  const [draft, setDraft] = useState(savedKey || "");
+  const [visible, setVisible] = useState(false);
+  const [justSaved, setJustSaved] = useState(false);
+
+  useEffect(() => {
+    setDraft(savedKey || "");
+  }, [savedKey]);
+
+  const hasKey = !!(savedKey && savedKey.trim());
+  const dirty = draft !== (savedKey || "");
+
+  function handleSave() {
+    onSave(providerKey, draft);
+    setJustSaved(true);
+    setTimeout(() => setJustSaved(false), 1600);
+  }
+
+  return (
+    <div style={{ background: "#1C1F26", border: BORDER, borderRadius: "12px", padding: "14px 16px" }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+          <span style={{ width: "13px", height: "13px", borderRadius: "50%", background: def.color, flexShrink: 0 }} />
+          <div>
+            <div style={{ fontWeight: 600, fontSize: "14px" }}>{def.label}</div>
+            {def.keyUrl && (
+              <a href={def.keyUrl} target="_blank" rel="noreferrer" style={{ fontSize: "12px", color: "#7C9BFF", textDecoration: "none" }}>
+                Get free key ↗
+              </a>
+            )}
+          </div>
+        </div>
+        {hasKey && !dirty ? (
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+            <title>Key saved</title>
+            <circle cx="9" cy="9" r="8" fill="#1E3A2A" stroke={SUCCESS} strokeWidth="1.2" />
+            <path d="M5.5 9.2l2.2 2.2 4.8-4.9" stroke={SUCCESS} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+          </svg>
+        ) : (
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+            <title>No key saved yet</title>
+            <path d="M9 2.2L16.3 15H1.7L9 2.2z" fill="#3A2E14" stroke={WARNING} strokeWidth="1.2" strokeLinejoin="round" />
+            <line x1="9" y1="7.2" x2="9" y2="10.6" stroke={WARNING} strokeWidth="1.3" strokeLinecap="round" />
+            <circle cx="9" cy="12.6" r="0.9" fill={WARNING} />
+          </svg>
+        )}
+      </div>
+      <div style={{ display: "flex", gap: "8px", marginTop: "12px" }}>
+        <div style={{ flex: 1, position: "relative" }}>
+          <input
+            type={visible ? "text" : "password"}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder={def.keyPlaceholder || "Paste API key"}
+            style={{ width: "100%", border: BORDER, background: BG, color: TEXT_PRIMARY, borderRadius: "9px", padding: "9px 36px 9px 12px", fontSize: "13px", fontFamily: "inherit", boxSizing: "border-box" }}
+          />
+          <button
+            onClick={() => setVisible((v) => !v)}
+            title={visible ? "Hide key" : "Show key"}
+            style={{ position: "absolute", right: "8px", top: "50%", transform: "translateY(-50%)", border: "none", background: "transparent", cursor: "pointer", color: TEXT_MUTED, padding: "2px", display: "flex" }}
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <path d="M1 8s2.6-4.5 7-4.5S15 8 15 8s-2.6 4.5-7 4.5S1 8 1 8z" stroke="currentColor" strokeWidth="1.2" fill="none" />
+              <circle cx="8" cy="8" r="2" stroke="currentColor" strokeWidth="1.2" fill="none" />
+              {!visible && <line x1="2" y1="13.5" x2="14" y2="2.5" stroke="currentColor" strokeWidth="1.2" />}
+            </svg>
+          </button>
+        </div>
+        <button
+          onClick={handleSave}
+          disabled={!dirty}
+          style={{
+            border: "none",
+            background: justSaved ? SUCCESS : dirty ? "#4C6FFF" : BORDER_COLOR,
+            color: dirty || justSaved ? "#fff" : TEXT_MUTED,
+            fontWeight: 600,
+            fontSize: "13px",
+            borderRadius: "9px",
+            padding: "0 18px",
+            cursor: dirty ? "pointer" : "default",
+            transition: "background 0.15s",
+          }}
+        >
+          {justSaved ? "Saved ✓" : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ProviderPicker({ providerKey, providerKeys, onSelect, compact }) {
+  const [open, setOpen] = useState(false);
+  const ref = useClickOutside(setOpen);
+
+  const label = PROVIDER_DEFAULTS[providerKey].label;
+
+  return (
+    <div ref={ref} style={{ position: "relative", flexShrink: 0, minWidth: 0 }}>
+      <button
+        className="col-select"
+        onClick={() => setOpen((o) => !o)}
+        style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: compact ? "12px" : "13px", maxWidth: compact ? "88px" : "150px", overflow: "hidden" }}
+      >
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
+        <svg width="9" height="9" viewBox="0 0 10 10" style={{ flexShrink: 0 }}>
+          <path d="M2 3.5L5 6.5L8 3.5" stroke="currentColor" strokeWidth="1.3" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+      {open && (
+        <div style={{ position: "absolute", top: "24px", left: 0, minWidth: "150px", background: PANEL_BG, border: BORDER, borderRadius: "9px", boxShadow: "0 12px 30px rgba(0,0,0,0.5)", zIndex: 40, overflow: "hidden" }}>
+          {providerKeys.map((p) => (
+            <div
+              key={p}
+              className="dropdown-item"
+              onClick={() => { onSelect(p); setOpen(false); }}
+              style={{ display: "flex", alignItems: "center", gap: "7px", padding: "8px 12px", fontSize: "13px", cursor: "pointer", color: p === providerKey ? PROVIDER_DEFAULTS[p].color : TEXT_SECONDARY, background: p === providerKey ? "rgba(255,255,255,0.05)" : "transparent" }}
+            >
+              <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: PROVIDER_DEFAULTS[p].color, flexShrink: 0 }} />
+              {PROVIDER_DEFAULTS[p].label}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ModelPicker({ color, model, providerKey, cacheEntry, onFetch, onSelect, compact }) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const ref = useClickOutside(setOpen);
+
+  function toggleOpen() {
+    const next = !open;
+    setOpen(next);
+    if (next && (!cacheEntry || (!cacheEntry.list.length && !cacheEntry.loading))) onFetch(providerKey);
+  }
+
+  const list = (cacheEntry && cacheEntry.list) || [];
+  const filtered = search
+    ? list.filter((m) => m.id.toLowerCase().includes(search.toLowerCase()) || m.label.toLowerCase().includes(search.toLowerCase()))
+    : list;
+  const exactMatch = list.some((m) => m.id === search);
+
+  return (
+    <div ref={ref} style={{ position: "relative" }}>
+      <button className="col-select" onClick={toggleOpen} style={{ display: "flex", alignItems: "center", gap: "5px", cursor: "pointer", fontSize: compact ? "12px" : "13px", minWidth: 0, color }}>
+        <span style={{ maxWidth: compact ? "90px" : "160px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{model}</span>
+        <svg width="10" height="10" viewBox="0 0 10 10" style={{ flexShrink: 0 }}>
+          <path d="M2 3.5L5 6.5L8 3.5" stroke="currentColor" strokeWidth="1.3" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+      {open && (
+        <div style={{ position: "absolute", top: "26px", left: 0, width: "270px", maxHeight: "320px", background: PANEL_BG, border: BORDER, borderRadius: "10px", boxShadow: "0 12px 30px rgba(0,0,0,0.5)", zIndex: 40, display: "flex", flexDirection: "column" }}>
+          <div style={{ padding: "8px", borderBottom: DIVIDER, display: "flex", gap: "6px" }}>
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search or type a model id"
+              style={{ flex: 1, background: BG, border: BORDER, borderRadius: "6px", color: TEXT_PRIMARY, fontSize: "12px", padding: "5px 8px" }}
+            />
+            <button className="ghost-btn" style={{ padding: "4px 8px", fontSize: "11px" }} onClick={() => onFetch(providerKey)}>
+              {cacheEntry && cacheEntry.loading ? "…" : "Refresh"}
+            </button>
+          </div>
+          <div style={{ overflowY: "auto", maxHeight: "260px" }}>
+            {search && !exactMatch && (
+              <div
+                onClick={() => { onSelect(search); setOpen(false); }}
+                style={{ padding: "8px 12px", fontSize: "13px", cursor: "pointer", color: TEXT_DIM, borderBottom: DIVIDER }}
+              >
+                Use "{search}"
+              </div>
+            )}
+            {cacheEntry && cacheEntry.loading && <div style={{ padding: "12px", fontSize: "12px", color: TEXT_MUTED }}>Loading models…</div>}
+            {cacheEntry && cacheEntry.error && <div style={{ padding: "12px", fontSize: "12px", color: ERROR }}>{cacheEntry.error}</div>}
+            {(!cacheEntry || !cacheEntry.loading) && filtered.length === 0 && !(cacheEntry && cacheEntry.error) && (
+              <div style={{ padding: "12px", fontSize: "12px", color: TEXT_MUTED }}>Add an API key in Settings, then Refresh.</div>
+            )}
+            {filtered.map((m) => (
+              <div
+                key={m.id}
+                className="dropdown-item"
+                onClick={() => { onSelect(m.id); setOpen(false); }}
+                style={{ padding: "8px 12px", fontSize: "13px", cursor: "pointer", color: m.id === model ? color : TEXT_SECONDARY, background: m.id === model ? "rgba(255,255,255,0.05)" : "transparent" }}
+              >
+                {m.label}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Native <select> popups can't be themed (hence the white box) — this mirrors ModelPicker's custom dropdown, minus search/fetch since the image list is small and fixed.
+function ImageModelPicker({ color, model, options, onSelect, compact }) {
+  const [open, setOpen] = useState(false);
+  const ref = useClickOutside(setOpen);
+  const current = options.find((m) => m.id === model);
+
+  return (
+    <div ref={ref} style={{ position: "relative" }}>
+      <button className="col-select" onClick={() => setOpen((v) => !v)} style={{ display: "flex", alignItems: "center", gap: "5px", cursor: "pointer", fontSize: compact ? "12px" : "13px", minWidth: 0, color }}>
+        <span style={{ maxWidth: compact ? "90px" : "160px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{(current && current.label) || model}</span>
+        <svg width="10" height="10" viewBox="0 0 10 10" style={{ flexShrink: 0 }}>
+          <path d="M2 3.5L5 6.5L8 3.5" stroke="currentColor" strokeWidth="1.3" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+      {open && (
+        <div style={{ position: "absolute", top: "26px", left: 0, width: "230px", maxHeight: "260px", overflowY: "auto", background: PANEL_BG, border: BORDER, borderRadius: "10px", boxShadow: "0 12px 30px rgba(0,0,0,0.5)", zIndex: 40 }}>
+          {options.map((m) => (
+            <div
+              key={m.id}
+              className="dropdown-item"
+              onClick={() => {
+                onSelect(m.id);
+                setOpen(false);
+              }}
+              style={{ padding: "8px 12px", fontSize: "13px", cursor: "pointer", color: m.id === model ? color : TEXT_SECONDARY, background: m.id === model ? "rgba(255,255,255,0.05)" : "transparent" }}
+            >
+              {m.label}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Real-time full-duplex voice via Gemini's Live API WebSocket (16kHz PCM16 up, 24kHz PCM16 down). Google-only — the one provider here with true low-latency bidirectional voice.
+function LiveVoiceModal({ apiKey, onClose }) {
+  const [status, setStatus] = useState("idle"); // idle | connecting | connected | error
+  const [error, setError] = useState("");
+  const [caption, setCaption] = useState("");
+  const wsRef = useRef(null);
+  const micStreamRef = useRef(null);
+  const micCtxRef = useRef(null);
+  const micProcessorRef = useRef(null);
+  const playCtxRef = useRef(null);
+  const nextPlayTimeRef = useRef(0);
+  const scheduledSourcesRef = useRef([]);
+  const statusRef = useRef(status);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+
+  useEffect(() => {
+    return () => disconnect();
+  }, []);
+
+  function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  function bytesToBase64(buffer) {
+    let binary = "";
+    const bytes = new Uint8Array(buffer);
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    return btoa(binary);
+  }
+
+  function downsampleTo16k(float32, inputRate) {
+    if (inputRate === 16000) return float32;
+    const ratio = inputRate / 16000;
+    const newLen = Math.round(float32.length / ratio);
+    const out = new Float32Array(newLen);
+    for (let i = 0; i < newLen; i++) out[i] = float32[Math.floor(i * ratio)];
+    return out;
+  }
+
+  function floatTo16BitPCM(float32) {
+    const buffer = new ArrayBuffer(float32.length * 2);
+    const view = new DataView(buffer);
+    let offset = 0;
+    for (let i = 0; i < float32.length; i++, offset += 2) {
+      const s = Math.max(-1, Math.min(1, float32[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return buffer;
+  }
+
+  function stopPlayback() {
+    scheduledSourcesRef.current.forEach((s) => safely(() => s.stop(0)));
+    scheduledSourcesRef.current = [];
+    if (playCtxRef.current) nextPlayTimeRef.current = playCtxRef.current.currentTime;
+  }
+
+  function playChunk(base64) {
+    if (!playCtxRef.current) {
+      playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      nextPlayTimeRef.current = 0;
+    }
+    const ctx = playCtxRef.current;
+    const bytes = base64ToBytes(base64);
+    const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+    const buffer = ctx.createBuffer(1, float32.length, 24000);
+    buffer.getChannelData(0).set(float32);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    const startAt = Math.max(ctx.currentTime, nextPlayTimeRef.current);
+    source.start(startAt);
+    nextPlayTimeRef.current = startAt + buffer.duration;
+    scheduledSourcesRef.current.push(source);
+    source.onended = () => {
+      scheduledSourcesRef.current = scheduledSourcesRef.current.filter((s) => s !== source);
+    };
+  }
+
+  function startMic() {
+    const stream = micStreamRef.current;
+    if (!stream) return;
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AudioCtx();
+    micCtxRef.current = ctx;
+    const source = ctx.createMediaStreamSource(stream);
+    const processor = ctx.createScriptProcessor(4096, 1, 1);
+    micProcessorRef.current = processor;
+    const silentGain = ctx.createGain();
+    silentGain.gain.value = 0;
+    processor.onaudioprocess = (e) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+      const down = downsampleTo16k(e.inputBuffer.getChannelData(0), ctx.sampleRate);
+      const b64 = bytesToBase64(floatTo16BitPCM(down));
+      wsRef.current.send(JSON.stringify({ realtimeInput: { audio: { data: b64, mimeType: "audio/pcm;rate=16000" } } }));
+    };
+    source.connect(processor);
+    processor.connect(silentGain);
+    silentGain.connect(ctx.destination);
+  }
+
+  function cleanupAudio() {
+    if (micProcessorRef.current) {
+      safely(() => micProcessorRef.current.disconnect());
+      micProcessorRef.current = null;
+    }
+    if (micCtxRef.current) {
+      safely(() => micCtxRef.current.close());
+      micCtxRef.current = null;
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+    }
+    stopPlayback();
+  }
+
+  async function connect() {
+    if (!apiKey || !apiKey.trim()) {
+      setError("Add a Google AI Studio API key in Settings first.");
+      setStatus("error");
+      return;
+    }
+    setStatus("connecting");
+    setError("");
+    try {
+      micStreamRef.current = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+      const ws = new WebSocket("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=" + apiKey);
+      wsRef.current = ws;
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ config: { model: "models/gemini-3.1-flash-live-preview", responseModalities: ["AUDIO"] } }));
+      };
+      ws.onmessage = async (event) => {
+        let text = event.data;
+        if (event.data instanceof Blob) text = await event.data.text();
+        let msg;
+        try {
+          msg = JSON.parse(text);
+        } catch (e) {
+          return;
+        }
+        if (msg.setupComplete) {
+          setStatus("connected");
+          startMic();
+          return;
+        }
+        const sc = msg.serverContent;
+        if (!sc) return;
+        if (sc.interrupted) stopPlayback();
+        const parts = sc.modelTurn && sc.modelTurn.parts;
+        if (parts) parts.forEach((p) => p.inlineData && p.inlineData.data && playChunk(p.inlineData.data));
+        if (sc.outputTranscription && sc.outputTranscription.text) setCaption((prev) => prev + sc.outputTranscription.text);
+        if (sc.turnComplete) setCaption("");
+      };
+      ws.onerror = () => {
+        setError("Connection error — check your API key and try again.");
+        setStatus("error");
+      };
+      ws.onclose = () => {
+        if (statusRef.current !== "error") setStatus("idle");
+        cleanupAudio();
+      };
+    } catch (err) {
+      setError(err.message || "Couldn't access the microphone.");
+      setStatus("error");
+    }
+  }
+
+  function disconnect() {
+    if (wsRef.current) {
+      safely(() => wsRef.current.close());
+      wsRef.current = null;
+    }
+    cleanupAudio();
+    setStatus("idle");
+    setCaption("");
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 60 }} onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} style={{ background: PANEL_BG, border: BORDER, borderRadius: "16px", width: "420px", maxWidth: "92vw", padding: "26px", textAlign: "center", boxShadow: "0 20px 60px rgba(0,0,0,0.5)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+          <div style={{ fontSize: "16px", fontWeight: 600 }}>Live voice — Gemini</div>
+          <button onClick={onClose} style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_DIM, fontSize: "18px" }}>
+            ×
+          </button>
+        </div>
+        <div style={{ fontSize: "12px", color: TEXT_MUTED, marginBottom: "22px" }}>Real-time, full-duplex voice — talk anytime, interrupt anytime.</div>
+
+        <div
+          style={{
+            width: "120px",
+            height: "120px",
+            borderRadius: "50%",
+            margin: "0 auto 20px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            background: status === "connected" ? "rgba(217,164,65,0.14)" : PANEL_BG_ALT,
+            border: "1px solid " + (status === "connected" ? ACCENT : BORDER_COLOR),
+            transition: "all 0.2s ease",
+          }}
+        >
+          <svg width="44" height="44" viewBox="0 0 44 44" fill="none">
+            <rect x="17" y="6" width="10" height="20" rx="5" fill={status === "connected" ? ACCENT : TEXT_MUTED} />
+            <path d="M10 20v2a12 12 0 0024 0v-2M22 34v5" stroke={status === "connected" ? ACCENT : TEXT_MUTED} strokeWidth="2" strokeLinecap="round" fill="none" />
+          </svg>
+        </div>
+
+        <div style={{ fontSize: "13px", color: TEXT_SOFT, minHeight: "18px", marginBottom: "4px" }}>
+          {status === "idle" && "Ready to connect"}
+          {status === "connecting" && "Connecting…"}
+          {status === "connected" && "Listening — speak naturally"}
+          {status === "error" && (error || "Something went wrong")}
+        </div>
+        <div style={{ fontSize: "12.5px", color: TEXT_MUTED2, minHeight: "34px", marginBottom: "16px", fontStyle: "italic" }}>{caption}</div>
+
+        {status === "connected" ? (
+          <button className="ghost-btn" style={{ padding: "9px 22px" }} onClick={disconnect}>
+            End call
+          </button>
+        ) : (
+          <button className="ghost-btn" style={{ padding: "9px 22px", borderColor: ACCENT, color: ACCENT }} onClick={connect} disabled={status === "connecting"}>
+            {status === "connecting" ? "Connecting…" : "Start talking"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Shared chrome for this app's two click-outside-to-close dialogs (history, settings): overlay + centered card + title-row header. Body content and a couple of sizing knobs are all that differ.
+// The avatar button in the top header — shows the signed-in email and a
+// Sign Out action. Supabase's own signOut() clears its session from local
+// storage and fires onAuthStateChange, which is what actually sends the
+// person back to the sign-in screen; this button just triggers that.
+function UserMenu({ session, onSignOut }) {
+  const [open, setOpen] = useState(false);
+  const ref = useClickOutside(setOpen);
+  const email = (session && session.user && session.user.email) || "";
+  const initial = email ? email[0].toUpperCase() : "?";
+  return (
+    <div ref={ref} style={{ position: "relative", flexShrink: 0 }}>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        title={email}
+        style={{
+          width: "30px",
+          height: "30px",
+          borderRadius: "50%",
+          background: PANEL_BG_ALT,
+          border: BORDER,
+          flexShrink: 0,
+          cursor: "pointer",
+          color: TEXT_SECONDARY,
+          fontSize: "12px",
+          fontWeight: 600,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        {initial}
+      </button>
+      {open && (
+        <div style={{ position: "absolute", top: "38px", right: 0, zIndex: 60, background: PANEL_BG, border: BORDER, borderRadius: "10px", padding: "10px", width: "200px", boxShadow: "0 12px 30px rgba(0,0,0,0.45)" }}>
+          <div style={{ fontSize: "12px", color: TEXT_MUTED, padding: "4px 6px 10px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", borderBottom: DIVIDER, marginBottom: "6px" }}>{email}</div>
+          <button className="ghost-btn" onClick={onSignOut} style={{ width: "100%", textAlign: "center" }}>
+            Sign Out
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Modal({ title, width, maxHeight, padding, headerMarginBottom, onClose, children }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50 }} onClick={onClose}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ background: PANEL_BG, border: BORDER, borderRadius: "14px", width: width || "480px", maxWidth: "92vw", maxHeight: maxHeight || "78vh", overflowY: "auto", padding: padding || "20px", boxShadow: "0 20px 60px rgba(0,0,0,0.5)" }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: headerMarginBottom || "14px" }}>
+          <div style={{ fontSize: "16px", fontWeight: 600 }}>{title}</div>
+          <button onClick={onClose} style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_DIM, fontSize: "18px" }}>
+            ×
+          </button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// Fully static (built only from the theme constants above) — computed once here instead of being rebuilt as a new string on every render of <Chatbot>.
+const GLOBAL_STYLE = `
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  * { box-sizing: border-box; }
+  @keyframes bounce { 0%,80%,100%{transform:scale(0.6);opacity:0.35} 40%{transform:scale(1);opacity:1} }
+  @keyframes riseIn { from { opacity:0; transform:translateY(4px);} to { opacity:1; transform:translateY(0);} }
+  .tdot { animation: bounce 1.2s infinite ease-in-out; }
+  .tdot:nth-child(2){ animation-delay:0.15s }
+  .tdot:nth-child(3){ animation-delay:0.3s }
+  .msg-in { animation: riseIn 0.18s ease-out; }
+  textarea::placeholder{ color:#5C5E66 }
+  textarea:focus{ outline:none }
+  ::-webkit-scrollbar{ width:7px; height:7px }
+  ::-webkit-scrollbar-thumb{ background:${BORDER_COLOR}; border-radius:4px }
+  ::-webkit-scrollbar-thumb:hover{ background:${BORDER_HOVER} }
+  input:focus{ outline:none }
+  select { appearance:none; -webkit-appearance:none; }
+  .ghost-btn { border:1px solid ${BORDER_COLOR}; background:${PANEL_BG}; color:${TEXT_SOFT}; border-radius:7px; cursor:pointer; padding:6px 12px; font-size:13px; font-family:inherit; transition: all 0.12s ease; }
+  .ghost-btn:hover { border-color:${BORDER_HOVER}; color:${TEXT_PRIMARY}; background:${PANEL_BG_ALT}; }
+  .chip { border:1px solid ${BORDER_COLOR}; background:${PANEL_BG}; color:${TEXT_SOFT}; border-radius:7px; cursor:pointer; padding:7px 12px; font-size:13px; font-family:inherit; transition: all 0.12s ease; }
+  .chip:hover { border-color:${BORDER_HOVER}; background:${PANEL_BG_ALT}; }
+  .send-btn { transition: background 0.15s ease, transform 0.1s ease; }
+  .send-btn:active { transform: scale(0.92); }
+  .col-select { background:transparent; border:none; color:${TEXT_SECONDARY}; font-size:13px; font-weight:500; font-family:inherit; cursor:pointer; padding:2px 4px; }
+  .dropdown-item:hover { background: rgba(255,255,255,0.07) !important; }
+  .dropdown-item--accent:hover { background: rgba(217,164,65,0.14) !important; }
+  .nav-item:hover { background: rgba(255,255,255,0.05) !important; color: ${TEXT_PRIMARY} !important; }
+  .sidebar-handle:hover { background: ${BORDER_HOVER} !important; }
+`;
+
+// Shared centered-card layout for the two pre-login screens below.
+// Tracks Supabase config + session for the whole app. Auth is optional here
+// — this hook just exposes what's currently known; nothing in it blocks
+// rendering. The premium button below is what actually decides when to ask
+// for sign-in, not this hook.
+function useSupabaseAuth() {
+  const [config, setConfig] = useState(loadSupabaseConfig);
+  const [session, setSession] = useState(null);
+
+  const client = useMemo(() => {
+    if (!config.url || !config.anonKey || typeof supabase === "undefined") return null;
+    return safely(() => supabase.createClient(config.url, config.anonKey), null);
+  }, [config.url, config.anonKey]);
+
+  useEffect(() => {
+    if (!client) {
+      setSession(null);
+      return;
+    }
+    let active = true;
+    client.auth.getSession().then(({ data }) => {
+      if (active) setSession(data.session);
+    });
+    const { data: sub } = client.auth.onAuthStateChange((_event, newSession) => setSession(newSession));
+    return () => {
+      active = false;
+      sub.subscription.unsubscribe();
+    };
+  }, [client]);
+
+  function saveConfig(cfg) {
+    saveSupabaseConfig(cfg);
+    setConfig(cfg);
+  }
+
+  function reconfigure() {
+    const empty = { url: "", anonKey: "" };
+    saveSupabaseConfig(empty);
+    setConfig(empty);
+    setSession(null);
+  }
+
+  return { config, saveConfig, reconfigure, client, session };
+}
+
+// First-run form: this app has no server of its own, so — same as every
+// provider API key elsewhere in it — the Supabase project URL and anon key
+// are typed in here and kept in this browser's local storage, not hardcoded.
+function SupabaseSetupForm({ onSave }) {
+  const [url, setUrl] = useState("");
+  const [anonKey, setAnonKey] = useState("");
+  return (
+    <div>
+      <div style={{ fontSize: "12.5px", color: TEXT_MUTED, marginBottom: "16px", lineHeight: 1.5 }}>Find these under Settings → API in your Supabase project.</div>
+      <label style={FIELD_LABEL_STYLE}>Project URL</label>
+      <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://xxxxxxxx.supabase.co" style={{ ...FIELD_INPUT_STYLE, marginBottom: "12px" }} />
+      <label style={FIELD_LABEL_STYLE}>Anon (public) key</label>
+      <input value={anonKey} onChange={(e) => setAnonKey(e.target.value)} placeholder="eyJhbGciOi..." style={{ ...FIELD_INPUT_STYLE, marginBottom: "16px" }} />
+      <button
+        className="ghost-btn"
+        disabled={!url.trim() || !anonKey.trim()}
+        onClick={() => onSave({ url: url.trim(), anonKey: anonKey.trim() })}
+        style={{ width: "100%", textAlign: "center", background: ACCENT, color: BG, border: "none", fontWeight: 600, opacity: !url.trim() || !anonKey.trim() ? 0.5 : 1 }}
+      >
+        Save & Continue
+      </button>
+    </div>
+  );
+}
+
+function AuthForm({ supabaseClient, onSuccess, onReconfigure }) {
+  const [mode, setMode] = useState("signin"); // "signin" | "signup"
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  function switchMode(next) {
+    setMode(next);
+    setError("");
+    setNotice("");
+  }
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!email.trim() || !password || busy) return;
+    setError("");
+    setNotice("");
+    setBusy(true);
+    try {
+      if (mode === "signin") {
+        const { error: err } = await supabaseClient.auth.signInWithPassword({ email: email.trim(), password });
+        if (err) throw err;
+        onSuccess();
+      } else {
+        const { error: err, data } = await supabaseClient.auth.signUp({ email: email.trim(), password });
+        if (err) throw err;
+        // A user with no session back means Supabase's default "confirm your
+        // email" flow kicked in — there's nothing more to do here until they
+        // click that link, so send them to the sign-in tab with an explanation.
+        if (data && data.session) {
+          onSuccess();
+        } else {
+          setNotice("Check your inbox to confirm your email, then sign in.");
+          setMode("signin");
+        }
+      }
+    } catch (err) {
+      setError(err.message || "Something went wrong.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const tabStyle = (tab) => ({
+    flex: 1,
+    textAlign: "center",
+    ...(mode === tab ? { background: PANEL_BG_ALT, color: TEXT_PRIMARY, borderColor: BORDER_HOVER } : {}),
+  });
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: "6px", marginBottom: "16px" }}>
+        <button className="ghost-btn" onClick={() => switchMode("signin")} style={tabStyle("signin")}>
+          Sign In
+        </button>
+        <button className="ghost-btn" onClick={() => switchMode("signup")} style={tabStyle("signup")}>
+          Sign Up
+        </button>
+      </div>
+      <form onSubmit={submit}>
+        <label style={FIELD_LABEL_STYLE}>Email</label>
+        <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required style={{ ...FIELD_INPUT_STYLE, marginBottom: "12px" }} />
+        <label style={FIELD_LABEL_STYLE}>Password</label>
+        <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={6} style={FIELD_INPUT_STYLE} />
+        {error && <div style={{ fontSize: "12px", color: ERROR, marginTop: "10px" }}>{error}</div>}
+        {notice && <div style={{ fontSize: "12px", color: SUCCESS, marginTop: "10px" }}>{notice}</div>}
+        <button
+          type="submit"
+          disabled={busy}
+          className="ghost-btn"
+          style={{ width: "100%", textAlign: "center", background: ACCENT, color: BG, border: "none", fontWeight: 600, marginTop: "14px", opacity: busy ? 0.6 : 1 }}
+        >
+          {busy ? "…" : mode === "signin" ? "Sign In" : "Create Account"}
+        </button>
+      </form>
+      <button onClick={onReconfigure} style={{ border: "none", background: "transparent", color: TEXT_FAINTEST, fontSize: "11px", marginTop: "16px", cursor: "pointer", textDecoration: "underline", display: "block" }}>
+        Use a different Supabase project
+      </button>
+    </div>
+  );
+}
+
+// There's no payment processor wired up here — "Confirm Upgrade" marks the
+// signed-in Supabase user as premium via auth user_metadata (a real,
+// persisted flag on their account) rather than faking a charge. Wiring an
+// actual payment provider (Stripe, etc.) behind this button is a separate
+// task with its own setup.
+function PremiumForm({ session, client, onDone }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [done, setDone] = useState(false);
+  const email = (session && session.user && session.user.email) || "";
+
+  async function confirmUpgrade() {
+    setBusy(true);
+    setError("");
+    try {
+      const { error: err } = await client.auth.updateUser({ data: { premium: true } });
+      if (err) throw err;
+      setDone(true);
+    } catch (err) {
+      setError(err.message || "Something went wrong.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (done) {
+    return (
+      <div style={{ textAlign: "center", padding: "8px 0" }}>
+        <div style={{ fontSize: "28px", marginBottom: "8px" }}>✨</div>
+        <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "6px" }}>You're on Premium</div>
+        <div style={{ fontSize: "12.5px", color: TEXT_MUTED, marginBottom: "16px" }}>Signed in as {email}.</div>
+        <button className="ghost-btn" onClick={onDone} style={{ width: "100%", textAlign: "center" }}>
+          Done
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{ fontSize: "12.5px", color: TEXT_MUTED, marginBottom: "16px", lineHeight: 1.5 }}>
+        Signed in as <strong style={{ color: TEXT_PRIMARY }}>{email}</strong>.
+      </div>
+      <div style={{ background: BG, border: BORDER, borderRadius: "10px", padding: "14px", marginBottom: "16px" }}>
+        <div style={{ fontSize: "13px", fontWeight: 600, marginBottom: "4px" }}>Premium</div>
+        <div style={{ fontSize: "11.5px", color: TEXT_MUTED, lineHeight: 1.5 }}>Placeholder plan — hook up a real payment provider before shipping this for actual purchases.</div>
+      </div>
+      {error && <div style={{ fontSize: "12px", color: ERROR, marginBottom: "12px" }}>{error}</div>}
+      <button
+        onClick={confirmUpgrade}
+        disabled={busy}
+        className="ghost-btn"
+        style={{ width: "100%", textAlign: "center", background: ACCENT, color: BG, border: "none", fontWeight: 600, opacity: busy ? 0.6 : 1 }}
+      >
+        {busy ? "…" : "Confirm Upgrade"}
+      </button>
+    </div>
+  );
+}
+
+// Shown once, before anything else: a checkbox-gated rules/instructions
+// screen. Nothing in the app renders behind it until accepted — Chatbot
+// checks TERMS_KEY before its own return and short-circuits to this.
+function TermsGate({ onAccept }) {
+  const [checked, setChecked] = useState(false);
+  return (
+    <div style={{ height: "100vh", width: "100%", background: BG, color: TEXT_PRIMARY, fontFamily: "'Inter', -apple-system, sans-serif", display: "flex", alignItems: "center", justifyContent: "center", padding: "20px" }}>
+      <style>{GLOBAL_STYLE}</style>
+      <div style={{ width: "480px", maxWidth: "100%", maxHeight: "85vh", display: "flex", flexDirection: "column", background: PANEL_BG, border: BORDER, borderRadius: "14px", boxShadow: "0 20px 60px rgba(0,0,0,0.5)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "9px", padding: "24px 26px 4px" }}>
+          <svg width="26" height="26" viewBox="0 0 26 26" style={{ flexShrink: 0 }}>
+            <circle cx="6.5" cy="6.5" r="4.6" fill={PROVIDER_DEFAULTS.google.color} opacity="0.9" />
+            <circle cx="19.5" cy="6.5" r="4.6" fill={PROVIDER_DEFAULTS.groq.color} opacity="0.85" />
+            <circle cx="6.5" cy="19.5" r="4.6" fill={PROVIDER_DEFAULTS.openrouter.color} opacity="0.85" />
+            <circle cx="19.5" cy="19.5" r="4.6" fill={PROVIDER_DEFAULTS.cloudflare.color} opacity="0.85" />
+            <circle cx="13" cy="13" r="4.6" fill={PROVIDER_DEFAULTS.mistral.color} opacity="0.85" />
+          </svg>
+          <span style={{ fontSize: "17px", fontWeight: 700 }}>Multiplex</span>
+        </div>
+        <div style={{ padding: "6px 26px", fontSize: "13px", color: TEXT_MUTED }}>Rules & instructions — please read before continuing.</div>
+
+        <div style={{ flex: 1, overflowY: "auto", padding: "12px 26px", fontSize: "13px", lineHeight: 1.6, color: TEXT_SECONDARY }}>
+          <p>Multiplex sends one message to several AI models at once so you can compare their replies side by side.</p>
+
+          <div style={{ fontSize: "11px", color: TEXT_FAINTEST, textTransform: "uppercase", letterSpacing: "0.05em", marginTop: "16px", marginBottom: "6px" }}>Bring your own keys</div>
+          <p>Each provider column needs its own API key, added in Settings. Multiplex doesn't supply or pay for any of them.</p>
+
+          <div style={{ fontSize: "11px", color: TEXT_FAINTEST, textTransform: "uppercase", letterSpacing: "0.05em", marginTop: "16px", marginBottom: "6px" }}>Your data stays local</div>
+          <p>Keys and chat history live only in this browser's local storage. Nothing passes through a Multiplex server — requests go straight from your browser to each provider's own API.</p>
+
+          <div style={{ fontSize: "11px", color: TEXT_FAINTEST, textTransform: "uppercase", letterSpacing: "0.05em", marginTop: "16px", marginBottom: "6px" }}>Your responsibility</div>
+          <p>You're responsible for following each provider's own terms and usage limits. This tool is provided as-is, with no warranty — verify anything important a model tells you.</p>
+        </div>
+
+        <div style={{ padding: "16px 26px 24px", borderTop: DIVIDER }}>
+          <label style={{ display: "flex", alignItems: "flex-start", gap: "9px", fontSize: "12.5px", color: TEXT_SECONDARY, cursor: "pointer", marginBottom: "14px" }}>
+            <input type="checkbox" checked={checked} onChange={(e) => setChecked(e.target.checked)} style={{ marginTop: "2px" }} />
+            I have read and accept these terms.
+          </label>
+          <button
+            disabled={!checked}
+            onClick={onAccept}
+            className="ghost-btn"
+            style={{ width: "100%", textAlign: "center", background: checked ? ACCENT : BORDER_COLOR, color: checked ? BG : TEXT_FAINTEST, border: "none", fontWeight: 600, cursor: checked ? "pointer" : "default" }}
+          >
+            Enter Multiplex
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Chatbot() {
+  const { config: supabaseConfig, saveConfig: saveSupabaseCfg, reconfigure: reconfigureSupabase, client: supabaseClient, session } = useSupabaseAuth();
+  const [authModalStep, setAuthModalStep] = useState(null); // null | "setup" | "signin" | "premium"
+  const isPremium = !!(session && session.user && session.user.user_metadata && session.user.user_metadata.premium);
+
+  function openPremiumFlow() {
+    if (!supabaseClient) {
+      setAuthModalStep("setup");
+    } else if (!session) {
+      setAuthModalStep("signin");
+    } else {
+      setAuthModalStep("premium");
+    }
+  }
+
+  const [providers, setProviders] = useState(() => loadStoredProviders());
+  const [modelsCache, setModelsCache] = useState({});
+  const [showSettings, setShowSettings] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const saved = safely(() => Number(localStorage.getItem(SIDEBAR_WIDTH_KEY)), null);
+    return saved && saved >= SIDEBAR_MIN && saved <= SIDEBAR_MAX ? saved : SIDEBAR_DEFAULT;
+  });
+  const sidebarWidthRef = useRef(sidebarWidth);
+  useEffect(() => {
+    sidebarWidthRef.current = sidebarWidth;
+  }, [sidebarWidth]);
+  const sidebarCollapsed = sidebarWidth < SIDEBAR_COLLAPSE_AT;
+  const [termsAccepted, setTermsAccepted] = useState(() => safely(() => localStorage.getItem(TERMS_KEY) === "1", false));
+  const [voiceOn, setVoiceOn] = useState(false);
+  const [voiceError, setVoiceError] = useState("");
+  const [showVoiceMenu, setShowVoiceMenu] = useState(false);
+  const voiceMenuRef = useClickOutside(setShowVoiceMenu);
+  const [availableVoices, setAvailableVoices] = useState([]);
+  const [voiceURI, setVoiceURI] = useState(() => {
+    try {
+      return localStorage.getItem(VOICE_KEY) || "";
+    } catch (e) {
+      return "";
+    }
+  });
+  const [columns, setColumns] = useState([{ id: uid(), provider: "google", model: PROVIDER_DEFAULTS.google.defaultModel, imageMode: false, imageModel: null }]);
+  const [conversations, setConversations] = useState({});
+  const [loading, setLoading] = useState({});
+  const [input, setInput] = useState("");
+  const [attachments, setAttachments] = useState([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [historyList, setHistoryList] = useState(() => loadHistoryList());
+  const [webSearchOn, setWebSearchOn] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [showLiveVoice, setShowLiveVoice] = useState(false);
+  const recognitionRef = useRef(null);
+  const handleSendRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const textareaRef = useRef(null);
+  const scrollRefs = useRef({});
+  const abortControllersRef = useRef({});
+  const sessionIdRef = useRef(uid());
+  const historySaveTimerRef = useRef(null);
+  const providersSaveTimerRef = useRef(null);
+
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, 160) + "px";
+    }
+  }, [input]);
+
+  useEffect(() => {
+    if (!voiceError) return;
+    const t = setTimeout(() => setVoiceError(""), 4500);
+    return () => clearTimeout(t);
+  }, [voiceError]);
+
+  useEffect(() => {
+    if (!("speechSynthesis" in window)) return;
+    function loadVoices() {
+      setAvailableVoices(window.speechSynthesis.getVoices());
+    }
+    loadVoices();
+    window.speechSynthesis.addEventListener("voiceschanged", loadVoices);
+    return () => window.speechSynthesis.removeEventListener("voiceschanged", loadVoices);
+  }, []);
+
+  useEffect(() => {
+    safely(() => localStorage.setItem(VOICE_KEY, voiceURI));
+  }, [voiceURI]);
+
+  // Auto-save the current session (debounced) so it shows up under "Previous chats" — skips empty sessions, strips attachments.
+  useEffect(() => {
+    const hasAnyMessage = Object.values(conversations).some((list) => list && list.length > 0);
+    if (!hasAnyMessage) return;
+    if (historySaveTimerRef.current) clearTimeout(historySaveTimerRef.current);
+    historySaveTimerRef.current = setTimeout(() => {
+      const snapshot = {
+        id: sessionIdRef.current,
+        title: makeHistoryTitle(conversations),
+        updatedAt: Date.now(),
+        columns: columns.map((c) => ({ id: c.id, provider: c.provider, model: c.model })),
+        conversations: stripAttachmentsForHistory(conversations),
+      };
+      setHistoryList((prev) => {
+        const next = [snapshot, ...prev.filter((e) => e.id !== sessionIdRef.current)].slice(0, HISTORY_LIMIT);
+        saveHistoryList(next);
+        return next;
+      });
+    }, 700);
+    return () => {
+      if (historySaveTimerRef.current) clearTimeout(historySaveTimerRef.current);
+    };
+  }, [conversations, columns]);
+
+  // Persist provider settings (keys, base URLs, default models) so they carry over between sessions.
+  useEffect(() => {
+    if (providersSaveTimerRef.current) clearTimeout(providersSaveTimerRef.current);
+    providersSaveTimerRef.current = setTimeout(() => {
+      saveProviders(providers);
+    }, 400);
+    return () => {
+      if (providersSaveTimerRef.current) clearTimeout(providersSaveTimerRef.current);
+    };
+  }, [providers]);
+
+  useEffect(() => {
+    columns.forEach((c) => {
+      const el = scrollRefs.current[c.id];
+      if (el) el.scrollTop = el.scrollHeight;
+    });
+  }, [conversations, loading, columns]);
+
+  function updateProvider(key, field, value) {
+    setProviders((prev) => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
+  }
+
+  async function loadModels(providerKey) {
+    setModelsCache((prev) => ({ ...prev, [providerKey]: { ...(prev[providerKey] || {}), loading: true, error: null, list: (prev[providerKey] && prev[providerKey].list) || [] } }));
+    try {
+      const list = await fetchModelsForProvider(providerKey, providers[providerKey]);
+      setModelsCache((prev) => ({ ...prev, [providerKey]: { list, loading: false, error: null } }));
+    } catch (err) {
+      setModelsCache((prev) => ({ ...prev, [providerKey]: { list: (prev[providerKey] && prev[providerKey].list) || [], loading: false, error: err.message } }));
+    }
+  }
+
+  function addColumn() {
+    if (columns.length >= 4) return;
+    const keys = Object.keys(PROVIDER_DEFAULTS);
+    const nextProvider = keys[columns.length % keys.length];
+    setColumns((prev) => [...prev, { id: uid(), provider: nextProvider, model: providers[nextProvider].defaultModel, imageMode: false, imageModel: null }]);
+  }
+
+  function removeColumn(id) {
+    if (columns.length <= 1) return;
+    const controller = abortControllersRef.current[id];
+    if (controller) controller.abort();
+    delete abortControllersRef.current[id];
+    setColumns((prev) => prev.filter((c) => c.id !== id));
+    setConversations((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setLoading((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    delete scrollRefs.current[id];
+  }
+
+  function setColumnProvider(id, provider) {
+    setColumns((prev) => prev.map((c) => (c.id === id ? { ...c, provider, model: providers[provider].defaultModel, imageMode: false, imageModel: null } : c)));
+  }
+
+  function setColumnModel(id, model) {
+    setColumns((prev) => prev.map((c) => (c.id === id ? { ...c, model } : c)));
+  }
+
+  function toggleColumnImageMode(id) {
+    setColumns((prev) =>
+      prev.map((c) => {
+        if (c.id !== id) return c;
+        if (c.imageMode) return { ...c, imageMode: false };
+        const opts = IMAGE_MODELS[c.provider] || [];
+        if (!opts.length) return c;
+        return { ...c, imageMode: true, imageModel: c.imageModel || opts[0].id };
+      })
+    );
+  }
+
+  function setColumnImageModel(id, model) {
+    setColumns((prev) => prev.map((c) => (c.id === id ? { ...c, imageModel: model } : c)));
+  }
+
+  async function handleFiles(fileList) {
+    const files = Array.from(fileList || []);
+    const results = [];
+    for (const f of files) {
+      if (f.type.startsWith("image/")) {
+        const dataUrl = await fileToDataUrl(f);
+        const base64 = dataUrl.split(",")[1];
+        results.push({ id: uid(), kind: "image", name: f.name, mimeType: f.type, dataUrl, base64 });
+      } else if (TEXT_FILE_EXT.test(f.name) || f.type.startsWith("text/")) {
+        const text = await fileToText(f);
+        results.push({ id: uid(), kind: "text", name: f.name, text });
+      }
+    }
+    setAttachments((prev) => [...prev, ...results]);
+  }
+
+  function removeAttachment(id) {
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+  }
+
+  function appendMessage(colId, msg) {
+    setConversations((prev) => ({ ...prev, [colId]: [...(prev[colId] || []), msg] }));
+  }
+
+  // Finds the most recent assistant message and shallow-merges `patch` into it — shared by streaming text (content/sources) and landing a finished image (images).
+  function patchLastAssistant(colId, patch) {
+    setConversations((prev) => {
+      const list = prev[colId] || [];
+      const copy = [...list];
+      for (let i = copy.length - 1; i >= 0; i--) {
+        if (copy[i].role === "assistant") {
+          copy[i] = { ...copy[i], ...patch };
+          break;
+        }
+      }
+      return { ...prev, [colId]: copy };
+    });
+  }
+
+  // Both runColumn and runColumnImage need the same key-missing check — centralized here so the wording only lives in one place.
+  function requireApiKey(providerKey, apiKey) {
+    if (!apiKey || !apiKey.trim()) {
+      throw new Error("No API key set for " + PROVIDER_DEFAULTS[providerKey].label + ". Add one in Settings (gear icon in the left rail) before sending messages.");
+    }
+  }
+
+  async function runColumn(col, userMsg, priorHistory) {
+    const controller = new AbortController();
+    abortControllersRef.current[col.id] = controller;
+    setLoading((prev) => ({ ...prev, [col.id]: true }));
+    appendMessage(col.id, userMsg);
+    appendMessage(col.id, { role: "assistant", content: "", id: uid() });
+    const ceiling = providers[col.provider].maxTokens || 4096;
+    const autoTokens = estimateAutoMaxTokens(userMsg.content, userMsg.attachments);
+    const cfg = {
+      apiKey: providers[col.provider].apiKey,
+      baseUrl: providers[col.provider].baseUrl,
+      model: col.model,
+      maxTokens: Math.min(autoTokens, ceiling),
+    };
+    let acc = "";
+    const sourcesByUrl = new Map();
+    const history = [...priorHistory, userMsg];
+    const startedAt = Date.now();
+    try {
+      requireApiKey(col.provider, cfg.apiKey);
+      await runProvider(
+        col.provider,
+        cfg,
+        history,
+        (delta) => {
+          acc += delta;
+          patchLastAssistant(col.id, { content: acc, ...(sourcesByUrl.size ? { sources: Array.from(sourcesByUrl.values()) } : {}) });
+        },
+        (newSources) => {
+          newSources.forEach((s) => {
+            if (s.url && !sourcesByUrl.has(s.url)) sourcesByUrl.set(s.url, s);
+          });
+          patchLastAssistant(col.id, { content: acc, sources: Array.from(sourcesByUrl.values()) });
+        },
+        controller.signal,
+        webSearchOn
+      );
+      patchLastAssistant(col.id, { elapsedMs: Date.now() - startedAt });
+      if (voiceOn && acc.trim()) speak(acc, (msg) => setVoiceError(msg), false, voiceURI);
+    } catch (err) {
+      if (err.name !== "AbortError") {
+        patchLastAssistant(col.id, { content: (acc ? acc + "\n\n" : "") + "[error] " + err.message });
+      }
+    } finally {
+      setLoading((prev) => ({ ...prev, [col.id]: false }));
+      if (abortControllersRef.current[col.id] === controller) delete abortControllersRef.current[col.id];
+    }
+  }
+
+  async function runColumnImage(col, userMsg) {
+    const controller = new AbortController();
+    abortControllersRef.current[col.id] = controller;
+    setLoading((prev) => ({ ...prev, [col.id]: true }));
+    appendMessage(col.id, userMsg);
+    appendMessage(col.id, { role: "assistant", content: "", id: uid(), images: [] });
+    const cfg = {
+      apiKey: providers[col.provider].apiKey,
+      baseUrl: providers[col.provider].baseUrl,
+      model: col.imageModel || ((IMAGE_MODELS[col.provider] || [])[0] && IMAGE_MODELS[col.provider][0].id),
+    };
+    const startedAt = Date.now();
+    try {
+      requireApiKey(col.provider, cfg.apiKey);
+      const images = await generateImage(col.provider, cfg, userMsg.content, controller.signal);
+      patchLastAssistant(col.id, { images, elapsedMs: Date.now() - startedAt });
+    } catch (err) {
+      if (err.name !== "AbortError") {
+        patchLastAssistant(col.id, { content: "[error] " + err.message });
+      }
+    } finally {
+      setLoading((prev) => ({ ...prev, [col.id]: false }));
+      if (abortControllersRef.current[col.id] === controller) delete abortControllersRef.current[col.id];
+    }
+  }
+
+  // Copy-to-clipboard and thumbs up/down are best-effort/local-only — clipboard
+  // access can be denied by the browser, and the reaction is just UI state
+  // (nothing is sent anywhere) so a click always toggles it visually.
+  function copyMessage(text) {
+    safely(() => navigator.clipboard.writeText(text));
+  }
+
+  function setMessageReaction(colId, msgId, value) {
+    setConversations((prev) => {
+      const list = prev[colId] || [];
+      return { ...prev, [colId]: list.map((m) => (m.id === msgId ? { ...m, reaction: m.reaction === value ? null : value } : m)) };
+    });
+  }
+
+  // Re-asks this column's last user message: trims that turn (and whatever
+  // came after it) off the visible history, then re-runs it fresh — the
+  // trimmed history is computed synchronously here and passed straight into
+  // runColumn/runColumnImage rather than re-read from state a moment later,
+  // so it can't ever pick up a stale pre-trim conversation.
+  function regenerateColumn(col) {
+    const list = conversations[col.id] || [];
+    let uIdx = -1;
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].role === "user") {
+        uIdx = i;
+        break;
+      }
+    }
+    if (uIdx === -1) return;
+    const userMsg = list[uIdx];
+    const priorHistory = list.slice(0, uIdx);
+    setConversations((prev) => ({ ...prev, [col.id]: priorHistory }));
+    if (col.imageMode) runColumnImage(col, userMsg);
+    else runColumn(col, userMsg, priorHistory);
+  }
+
+  function handleSend(overrideText) {
+    if (anyBusy) return;
+    const text = (overrideText !== undefined ? overrideText : input).trim();
+    if (!text && attachments.length === 0) return;
+    const userMsg = { role: "user", content: text, attachments, id: uid() };
+    setInput("");
+    setAttachments([]);
+    columns.forEach((col) => (col.imageMode ? runColumnImage(col, userMsg) : runColumn(col, userMsg, conversations[col.id] || [])));
+  }
+
+  handleSendRef.current = handleSend;
+
+  function handleKeyDown(e) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  }
+
+  // Push-to-talk: dictate via SpeechRecognition, auto-send on silence, and auto-enable read-aloud so the whole thing can run hands-free.
+  function toggleListening() {
+    if (listening) {
+      if (recognitionRef.current) recognitionRef.current.stop();
+      return;
+    }
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      setVoiceError("Voice input isn't supported in this browser — try Chrome or Edge.");
+      return;
+    }
+    const recognition = new SR();
+    recognition.lang = navigator.language || "en-US";
+    recognition.interimResults = true;
+    recognition.continuous = false;
+    recognition.maxAlternatives = 1;
+    let finalTranscript = "";
+    recognition.onresult = (e) => {
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalTranscript += t;
+        else interim += t;
+      }
+      setInput((finalTranscript + interim).trim());
+    };
+    recognition.onerror = (e) => {
+      if (e.error !== "aborted" && e.error !== "no-speech") setVoiceError("Voice input error: " + e.error);
+      setListening(false);
+    };
+    recognition.onend = () => {
+      setListening(false);
+      recognitionRef.current = null;
+      const text = finalTranscript.trim();
+      if (text) {
+        setVoiceOn(true); // keep replies spoken aloud so the conversation can continue hands-free
+        handleSendRef.current(text);
+      }
+    };
+    recognitionRef.current = recognition;
+    setListening(true);
+    try {
+      recognition.start();
+    } catch (e) {
+      setListening(false);
+      setVoiceError("Couldn't start voice input: " + e.message);
+    }
+  }
+
+  useEffect(() => {
+    return () => {
+      if (recognitionRef.current) recognitionRef.current.stop();
+    };
+  }, []);
+
+  // Cancels every in-flight column request — needed when tearing down the current conversation (new chat, or jumping to a different one) so a late reply doesn't land somewhere it no longer belongs.
+  function abortAllRequests() {
+    Object.values(abortControllersRef.current).forEach((c) => c && c.abort());
+    abortControllersRef.current = {};
+  }
+
+  // Drag-to-resize: attaches document-level listeners only for the duration
+  // of the drag (added on mousedown, removed on mouseup) rather than
+  // permanently, and persists just once at the end rather than on every
+  // mousemove. Reads the live width from a ref at that point since state
+  // updates from the many onMove calls won't have flushed into this
+  // closure's own `sidebarWidth` yet.
+  function startSidebarDrag(e) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = sidebarWidth;
+    function onMove(ev) {
+      setSidebarWidth(Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, startWidth + (ev.clientX - startX))));
+    }
+    function onUp() {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      safely(() => localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidthRef.current)));
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
+
+  function toggleSidebarCollapse() {
+    const next = sidebarCollapsed ? SIDEBAR_DEFAULT : SIDEBAR_MIN;
+    setSidebarWidth(next);
+    safely(() => localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next)));
+  }
+
+  function resetAll() {
+    abortAllRequests();
+    setConversations({});
+    setLoading({});
+    setInput("");
+    setAttachments([]);
+    // New chat gets its own session id — reusing the old one let the autosave effect overwrite the previous chat's history entry.
+    sessionIdRef.current = uid();
+  }
+
+  function restoreHistoryEntry(entry) {
+    abortAllRequests();
+    setLoading({});
+    sessionIdRef.current = entry.id;
+    setColumns(entry.columns.map((c) => ({ id: c.id, provider: c.provider, model: c.model })));
+    setConversations(entry.conversations || {});
+    setInput("");
+    setAttachments([]);
+    setShowHistory(false);
+  }
+
+  function deleteHistoryEntry(id, e) {
+    if (e) e.stopPropagation();
+    setHistoryList((prev) => {
+      const next = prev.filter((h) => h.id !== id);
+      saveHistoryList(next);
+      return next;
+    });
+  }
+
+  function copyMessage(text) {
+    if (navigator.clipboard) navigator.clipboard.writeText(text);
+  }
+
+  const anyBusy = Object.values(loading).some(Boolean);
+  const isSingle = columns.length === 1;
+  const compact = columns.length >= 3;
+  const providerKeys = Object.keys(PROVIDER_DEFAULTS);
+
+  if (!termsAccepted) {
+    return (
+      <TermsGate
+        onAccept={() => {
+          safely(() => localStorage.setItem(TERMS_KEY, "1"));
+          setTermsAccepted(true);
+        }}
+      />
+    );
+  }
+
+  return (
+    <div style={{ display: "flex", height: "100vh", width: "100%", background: BG, color: TEXT_PRIMARY, fontFamily: "'Inter', -apple-system, sans-serif" }}>
+      <style>{GLOBAL_STYLE}</style>
+
+      <div style={{ width: sidebarWidth + "px", flexShrink: 0, borderRight: DIVIDER, display: "flex", flexDirection: "column", padding: sidebarCollapsed ? "18px 10px" : "18px 14px", overflow: "hidden" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: sidebarCollapsed ? "center" : "space-between", gap: "9px", marginBottom: "4px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "9px", minWidth: 0 }}>
+            <svg width="26" height="26" viewBox="0 0 26 26" style={{ flexShrink: 0 }}>
+              <circle cx="6.5" cy="6.5" r="4.6" fill={PROVIDER_DEFAULTS.google.color} opacity="0.9" />
+              <circle cx="19.5" cy="6.5" r="4.6" fill={PROVIDER_DEFAULTS.groq.color} opacity="0.85" />
+              <circle cx="6.5" cy="19.5" r="4.6" fill={PROVIDER_DEFAULTS.openrouter.color} opacity="0.85" />
+              <circle cx="19.5" cy="19.5" r="4.6" fill={PROVIDER_DEFAULTS.cloudflare.color} opacity="0.85" />
+              <circle cx="13" cy="13" r="4.6" fill={PROVIDER_DEFAULTS.mistral.color} opacity="0.85" />
+            </svg>
+            {!sidebarCollapsed && <span style={{ fontSize: "16px", fontWeight: 700, letterSpacing: "-0.01em" }}>Multiplex</span>}
+          </div>
+          {!sidebarCollapsed && (
+            <button onClick={toggleSidebarCollapse} title="Collapse sidebar" style={{ border: "none", background: "transparent", color: TEXT_FAINT, cursor: "pointer", padding: "3px", display: "flex", flexShrink: 0 }}>
+              <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+                <path d="M9 2.5L4 7l5 4.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+              </svg>
+            </button>
+          )}
+        </div>
+        {!sidebarCollapsed && (
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "18px", paddingLeft: "2px" }}>
+            <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: SUCCESS, flexShrink: 0 }} />
+            <span style={{ fontSize: "11.5px", color: TEXT_MUTED }}>
+              {columns.length} model{columns.length > 1 ? "s" : ""} active
+            </span>
+          </div>
+        )}
+        {sidebarCollapsed && (
+          <button onClick={toggleSidebarCollapse} title="Expand sidebar" style={{ border: "none", background: "transparent", color: TEXT_FAINT, cursor: "pointer", padding: "6px 0 14px", display: "flex", justifyContent: "center", width: "100%" }}>
+            <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+              <path d="M5 2.5L10 7l-5 4.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+            </svg>
+          </button>
+        )}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
+          <NavItem
+            collapsed={sidebarCollapsed}
+            active
+            label="Home"
+            icon={
+              <svg width="16" height="16" viewBox="0 0 17 17" fill="none">
+                <path d="M2.5 8L8.5 2.5L14.5 8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M4 6.8V14a0.6 0.6 0 00.6.6h7.8a0.6 0.6 0 00.6-.6V6.8" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />
+              </svg>
+            }
+          />
+          <NavItem
+            collapsed={sidebarCollapsed}
+            label="New Chat"
+            onClick={resetAll}
+            icon={
+              <svg width="16" height="16" viewBox="0 0 17 17" fill="none">
+                <path
+                  d="M2.5 3.3h12a1 1 0 0 1 1 1v6.4a1 1 0 0 1-1 1H7.1l-2.9 2.6a0.45 0.45 0 0 1-0.75-0.33v-2.27H2.5a1 1 0 0 1-1-1v-6.4a1 1 0 0 1 1-1z"
+                  stroke="currentColor"
+                  strokeWidth="1.3"
+                  strokeLinejoin="round"
+                  fill="none"
+                />
+                <line x1="8.5" y1="5.6" x2="8.5" y2="9" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+                <line x1="6.8" y1="7.3" x2="10.2" y2="7.3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+              </svg>
+            }
+          />
+          <NavItem
+            collapsed={sidebarCollapsed}
+            label="Compare"
+            icon={
+              <svg width="16" height="16" viewBox="0 0 17 17" fill="none">
+                <rect x="2" y="9" width="3" height="6" rx="0.8" fill="currentColor" />
+                <rect x="7" y="5" width="3" height="10" rx="0.8" fill="currentColor" />
+                <rect x="12" y="2" width="3" height="13" rx="0.8" fill="currentColor" />
+              </svg>
+            }
+          />
+          <div ref={voiceMenuRef} style={{ position: "relative" }}>
+            <NavItem
+              collapsed={sidebarCollapsed}
+              label="Voice"
+              active={voiceOn || showVoiceMenu}
+              onClick={() => setShowVoiceMenu((v) => !v)}
+              icon={
+                <svg width="16" height="16" viewBox="0 0 17 17" fill="none">
+                  <rect x="2" y="7" width="2.4" height="3" rx="1" fill="currentColor" />
+                  <rect x="6" y="4" width="2.4" height="9" rx="1" fill="currentColor" />
+                  <rect x="10" y="1.5" width="2.4" height="14" rx="1" fill="currentColor" />
+                </svg>
+              }
+            />
+            {showVoiceMenu && (
+              <div
+                style={{
+                  position: "absolute",
+                  left: "0",
+                  top: "40px",
+                  zIndex: 60,
+                  background: PANEL_BG,
+                  border: BORDER,
+                  borderRadius: "10px",
+                  padding: "12px",
+                  width: "230px",
+                  boxShadow: "0 12px 30px rgba(0,0,0,0.45)",
+                }}
+              >
+                <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "13px", fontWeight: 600, cursor: "pointer", marginBottom: "10px" }}>
+                  Read replies aloud
+                  <input
+                    type="checkbox"
+                    checked={voiceOn}
+                    onChange={(e) => {
+                      const next = e.target.checked;
+                      setVoiceOn(next);
+                      if (!next && "speechSynthesis" in window) window.speechSynthesis.cancel();
+                    }}
+                  />
+                </label>
+                <label style={{ fontSize: "11px", color: TEXT_MUTED, textTransform: "uppercase", letterSpacing: "0.04em" }}>Voice</label>
+                <select
+                  value={voiceURI}
+                  onChange={(e) => setVoiceURI(e.target.value)}
+                  style={{ width: "100%", border: BORDER, background: BG, color: TEXT_PRIMARY, borderRadius: "8px", padding: "7px 9px", fontSize: "12px", marginTop: "4px", fontFamily: "inherit" }}
+                >
+                  <option value="">System default</option>
+                  {availableVoices.map((v) => (
+                    <option key={v.voiceURI} value={v.voiceURI}>
+                      {v.name} ({v.lang})
+                    </option>
+                  ))}
+                </select>
+                {availableVoices.length === 0 && (
+                  <div style={{ fontSize: "11px", color: TEXT_MUTED, marginTop: "6px" }}>No voices found yet — try again in a moment.</div>
+                )}
+                <button
+                  className="ghost-btn"
+                  onClick={() => { setShowVoiceMenu(false); setShowLiveVoice(true); }}
+                  style={{ width: "100%", marginTop: "10px", textAlign: "center" }}
+                >
+                  Start live voice chat
+                </button>
+              </div>
+            )}
+          </div>
+          <NavItem
+            collapsed={sidebarCollapsed}
+            label="Settings"
+            active={showSettings}
+            onClick={() => setShowSettings(true)}
+            icon={
+              <svg width="16" height="16" viewBox="0 0 17 17" fill="none">
+                <line x1="2" y1="4" x2="15" y2="4" stroke="currentColor" strokeWidth="1.4" />
+                <circle cx="6.5" cy="4" r="1.8" fill={BG} stroke="currentColor" strokeWidth="1.4" />
+                <line x1="2" y1="8.5" x2="15" y2="8.5" stroke="currentColor" strokeWidth="1.4" />
+                <circle cx="10.5" cy="8.5" r="1.8" fill={BG} stroke="currentColor" strokeWidth="1.4" />
+                <line x1="2" y1="13" x2="15" y2="13" stroke="currentColor" strokeWidth="1.4" />
+                <circle cx="5" cy="13" r="1.8" fill={BG} stroke="currentColor" strokeWidth="1.4" />
+              </svg>
+            }
+          />
+          <NavItem
+            collapsed={sidebarCollapsed}
+            label="History"
+            active={showHistory}
+            onClick={() => setShowHistory(true)}
+            icon={
+              <svg width="16" height="16" viewBox="0 0 17 17" fill="none">
+                <circle cx="8.5" cy="9" r="6" stroke="currentColor" strokeWidth="1.4" fill="none" />
+                <path d="M8.5 5.8V9l2.6 1.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M4.2 3.5L2.8 2.2M2.8 2.2v2.2M2.8 2.2h2.2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            }
+          />
+          <NavItem
+            collapsed={sidebarCollapsed}
+            label="Saved Chats"
+            onClick={() => setShowHistory(true)}
+            icon={
+              <svg width="16" height="16" viewBox="0 0 17 17" fill="none">
+                <path d="M3 2.8h11a0.7 0.7 0 01.7.7v10.8l-6.2-3.4-6.2 3.4V3.5a0.7 0.7 0 01.7-.7z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" fill="none" />
+              </svg>
+            }
+          />
+        </div>
+
+        {!sidebarCollapsed && <div style={{ fontSize: "10.5px", color: TEXT_FAINTEST, textTransform: "uppercase", letterSpacing: "0.05em", margin: "18px 10px 6px" }}>Quick Actions</div>}
+        <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
+          <NavItem
+            collapsed={sidebarCollapsed}
+            label="Upload Image"
+            onClick={() => fileInputRef.current && fileInputRef.current.click()}
+            icon={
+              <svg width="16" height="16" viewBox="0 0 18 18" fill="none">
+                <rect x="2" y="3" width="14" height="12" rx="2" stroke="currentColor" strokeWidth="1.3" fill="none" />
+                <circle cx="6.3" cy="7" r="1.4" fill="currentColor" />
+                <path d="M3 13.5l4-4 3 3 2.5-3 3.5 4.5" stroke="currentColor" strokeWidth="1.3" fill="none" strokeLinejoin="round" />
+              </svg>
+            }
+          />
+          <NavItem
+            collapsed={sidebarCollapsed}
+            label="Upload File"
+            onClick={() => fileInputRef.current && fileInputRef.current.click()}
+            icon={
+              <svg width="16" height="16" viewBox="0 0 18 18" fill="none">
+                <path d="M11.5 3.5l-6 6a3 3 0 004.2 4.2l6-6a2 2 0 00-2.8-2.8l-5.7 5.7" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" fill="none" />
+              </svg>
+            }
+          />
+          <NavItem
+            collapsed={sidebarCollapsed}
+            label="Use Microphone"
+            onClick={toggleListening}
+            active={listening}
+            icon={
+              <svg width="16" height="16" viewBox="0 0 18 18" fill="none">
+                <rect x="7" y="2" width="4" height="8" rx="2" fill="currentColor" />
+                <path d="M4 8.5v1a5 5 0 0010 0v-1M9 14.5v2" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" fill="none" />
+              </svg>
+            }
+          />
+        </div>
+
+        <div style={{ flex: 1 }} />
+
+        <div style={{ borderTop: DIVIDER, paddingTop: "14px", marginBottom: sidebarCollapsed ? "0" : "14px" }}>
+          {isPremium ? (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: sidebarCollapsed ? "center" : "flex-start", gap: "7px", fontSize: "12.5px", color: ACCENT, fontWeight: 600 }} title={sidebarCollapsed ? "Premium" : undefined}>
+              <span>✨</span> {!sidebarCollapsed && "Premium"}
+            </div>
+          ) : (
+            <button
+              className="ghost-btn"
+              onClick={openPremiumFlow}
+              title={sidebarCollapsed ? "Upgrade to Premium" : undefined}
+              style={{ width: "100%", textAlign: "center", background: ACCENT, color: BG, border: "none", fontWeight: 600, padding: sidebarCollapsed ? "6px" : "6px 12px" }}
+            >
+              {sidebarCollapsed ? "✨" : "Upgrade to Premium"}
+            </button>
+          )}
+        </div>
+
+        {!sidebarCollapsed && (
+          <div style={{ borderTop: DIVIDER, paddingTop: "14px" }}>
+            <div style={{ fontSize: "10.5px", color: TEXT_FAINTEST, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "8px" }}>Model Usage</div>
+            <div style={{ width: "100%", height: "5px", borderRadius: "3px", background: BORDER_COLOR, overflow: "hidden", marginBottom: "7px" }}>
+              <div style={{ width: (columns.length / 4) * 100 + "%", height: "100%", background: SUCCESS, borderRadius: "3px" }} />
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: SUCCESS, flexShrink: 0 }} />
+              <span style={{ fontSize: "11.5px", color: TEXT_MUTED }}>{columns.length}/4 active</span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div
+        onMouseDown={startSidebarDrag}
+        title="Drag to resize"
+        style={{ width: "5px", flexShrink: 0, cursor: "col-resize", background: "transparent" }}
+        className="sidebar-handle"
+      />
+
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+        <div style={{ padding: "14px 20px", borderBottom: DIVIDER, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: "10px" }}>
+          <button className="ghost-btn" onClick={() => setShowSettings(true)}>
+            Settings
+          </button>
+          <button className="ghost-btn" onClick={addColumn} disabled={columns.length >= 4} title={columns.length >= 4 ? "Maximum of 4 models" : "Compare another model"} style={{ opacity: columns.length >= 4 ? 0.5 : 1 }}>
+            + Add Model
+          </button>
+          <button className="ghost-btn" onClick={resetAll}>
+            New Chat
+          </button>
+          {session && <UserMenu session={session} onSignOut={() => supabaseClient.auth.signOut()} />}
+        </div>
+
+        <div style={{ flex: 1, display: "flex", minHeight: 0, overflowX: "auto" }}>
+          {columns.map((col) => {
+            const list = conversations[col.id] || [];
+            const providerDef = PROVIDER_DEFAULTS[col.provider];
+            return (
+              <div key={col.id} style={{ flex: "1 0 " + (columns.length >= 3 ? "300px" : "240px"), minWidth: columns.length >= 3 ? "300px" : 0, minHeight: 0, display: "flex", flexDirection: "column", borderRight: DIVIDER }}>
+                <div style={{ padding: compact ? "7px 10px" : "8px 14px", borderBottom: DIVIDER, display: "flex", alignItems: "center", justifyContent: "space-between", gap: "6px", background: "#15171C" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: compact ? "6px" : "9px", minWidth: 0 }}>
+                    <span style={{ width: "10px", height: "10px", borderRadius: "50%", background: providerDef.color, flexShrink: 0 }} />
+                    <ProviderPicker providerKey={col.provider} providerKeys={providerKeys} onSelect={(p) => setColumnProvider(col.id, p)} compact={compact} />
+                    <div style={{ background: providerDef.color + "22", borderRadius: "999px", padding: compact ? "1px 7px" : "2px 9px", minWidth: 0 }}>
+                      {col.imageMode ? (
+                        <ImageModelPicker
+                          color={providerDef.color}
+                          model={col.imageModel}
+                          options={IMAGE_MODELS[col.provider] || []}
+                          onSelect={(m) => setColumnImageModel(col.id, m)}
+                          compact={compact}
+                        />
+                      ) : (
+                        <ModelPicker
+                          color={providerDef.color}
+                          model={col.model}
+                          providerKey={col.provider}
+                          cacheEntry={modelsCache[col.provider]}
+                          onFetch={loadModels}
+                          onSelect={(m) => setColumnModel(col.id, m)}
+                          compact={compact}
+                        />
+                      )}
+                    </div>
+                    {!col.imageMode && webSearchOn && (
+                      <span
+                        title={
+                          getWebSearchMode(col.provider, col.model) !== "none"
+                            ? "Web search is supported here and will be used for this reply"
+                            : "This provider/model has no request-level web search — it will answer from training data only"
+                        }
+                        style={{ display: "inline-flex", alignItems: "center", flexShrink: 0 }}
+                      >
+                        <svg width="12" height="12" viewBox="0 0 18 18" fill="none" style={{ opacity: getWebSearchMode(col.provider, col.model) !== "none" ? 1 : 0.3 }}>
+                          <circle cx="9" cy="9" r="6.5" stroke={getWebSearchMode(col.provider, col.model) !== "none" ? ACCENT : TEXT_DIM} strokeWidth="1.4" />
+                          <ellipse cx="9" cy="9" rx="2.7" ry="6.5" stroke={getWebSearchMode(col.provider, col.model) !== "none" ? ACCENT : TEXT_DIM} strokeWidth="1.1" />
+                          <line x1="2.6" y1="9" x2="15.4" y2="9" stroke={getWebSearchMode(col.provider, col.model) !== "none" ? ACCENT : TEXT_DIM} strokeWidth="1.1" />
+                        </svg>
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", flexShrink: 0 }}>
+                    {(IMAGE_MODELS[col.provider] || []).length > 0 && (
+                      <button
+                        onClick={() => toggleColumnImageMode(col.id)}
+                        title={col.imageMode ? "Switch back to chat" : "Switch this column to image generation"}
+                        style={{
+                          border: "none",
+                          background: col.imageMode ? "rgba(217,164,65,0.14)" : "transparent",
+                          color: col.imageMode ? ACCENT : TEXT_MUTED,
+                          cursor: "pointer",
+                          display: "flex",
+                          padding: "3px",
+                          borderRadius: "6px",
+                        }}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 18 18" fill="none">
+                          <rect x="2" y="3" width="14" height="12" rx="2" stroke="currentColor" strokeWidth="1.3" fill="none" />
+                          <circle cx="6.3" cy="7" r="1.4" fill="currentColor" />
+                          <path d="M3 13.5l4-4 3 3 2.5-3 3.5 4.5" stroke="currentColor" strokeWidth="1.3" fill="none" strokeLinejoin="round" />
+                        </svg>
+                      </button>
+                    )}
+                    {columns.length > 1 && (
+                      <button onClick={() => removeColumn(col.id)} style={{ border: "none", background: "transparent", color: TEXT_MUTED, cursor: "pointer", fontSize: "15px", flexShrink: 0 }} aria-label="Remove model">
+                        ×
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div ref={(el) => (scrollRefs.current[col.id] = el)} style={{ flex: 1, overflowY: "auto", padding: compact ? "16px 14px" : "18px 20px" }}>
+                  {list.length === 0 && isSingle && (
+                    <div style={{ marginTop: "10%", textAlign: "center" }}>
+                      <div style={{ fontSize: "20px", fontWeight: 600, color: TEXT_SECONDARY, marginBottom: "18px" }}>Where should we start?</div>
+                      <div style={{ display: "flex", gap: "8px", justifyContent: "center", flexWrap: "wrap" }}>
+                        {["Explain quantum entanglement simply", "Draft a launch email for a new feature", "Debug why my React state isn't updating"].map((p) => (
+                          <button key={p} className="chip" onClick={() => handleSend(p)}>
+                            {p}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {list.length === 0 && !isSingle && <div style={{ color: TEXT_FAINTEST, fontSize: "13px", textAlign: "center", marginTop: "40px" }}>Waiting for a prompt</div>}
+
+                  {list.map((m, i) => (
+                    <div key={m.id || i} className="msg-in" style={{ marginBottom: "18px" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "7px", marginBottom: "6px" }}>
+                        {m.role === "assistant" ? <Avatar color={providerDef.color} label={providerDef.label} /> : <div style={{ width: "22px", height: "22px", borderRadius: "50%", background: "#33363F" }} />}
+                        <span style={{ fontSize: "12px", color: m.role === "user" ? TEXT_MUTED : providerDef.color, fontWeight: 600 }}>
+                          {m.role === "user" ? "You" : col.imageMode ? col.imageModel : col.model}
+                        </span>
+                      </div>
+
+                      {m.attachments && m.attachments.length > 0 && (
+                        <div style={{ display: "flex", gap: "6px", marginBottom: "8px", flexWrap: "wrap", paddingLeft: "29px" }}>
+                          {m.attachments.map((a) =>
+                            a.kind === "image" ? (
+                              <img key={a.id} src={a.dataUrl} alt={a.name} style={{ width: "56px", height: "56px", objectFit: "cover", borderRadius: "8px", border: BORDER }} />
+                            ) : (
+                              <div key={a.id} style={{ fontSize: "11px", padding: "4px 10px", background: PANEL_BG_ALT, borderRadius: "6px", color: TEXT_DIM }}>
+                                {a.name}
+                              </div>
+                            )
+                          )}
+                        </div>
+                      )}
+
+                      <div style={{ paddingLeft: "29px" }}>
+                        {m.role === "assistant" && m.images && m.images.length > 0 && (
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginBottom: "6px" }}>
+                            {m.images.map((src, ii) => (
+                              <a key={ii} href={src} target="_blank" rel="noopener noreferrer">
+                                <img src={src} alt="Generated" style={{ maxWidth: "260px", maxHeight: "260px", borderRadius: "10px", border: BORDER, display: "block" }} />
+                              </a>
+                            ))}
+                          </div>
+                        )}
+                        <div
+                          style={{
+                            fontSize: "14.5px",
+                            lineHeight: 1.65,
+                            color: m.role === "user" ? TEXT_PRIMARY : "#DEDFE4",
+                            background: m.role === "user" ? PANEL_BG_ALT : "transparent",
+                            padding: m.role === "user" ? "9px 13px" : "0",
+                            borderRadius: "12px",
+                            display: "inline-block",
+                            maxWidth: "100%",
+                          }}
+                        >
+                          <MessageContent text={m.content} />
+                        </div>
+                        {m.role === "assistant" && m.sources && m.sources.length > 0 && (
+                          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "8px" }}>
+                            {m.sources.slice(0, 6).map((s, si) => {
+                              const host = safely(() => new URL(s.url).hostname.replace(/^www\./, ""), s.title || s.url);
+                              return (
+                                <a
+                                  key={s.url || si}
+                                  href={s.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title={s.title || s.url}
+                                  style={{
+                                    fontSize: "11px",
+                                    color: TEXT_DIM,
+                                    background: PANEL_BG_ALT,
+                                    border: BORDER,
+                                    borderRadius: "6px",
+                                    padding: "3px 9px",
+                                    textDecoration: "none",
+                                    maxWidth: "170px",
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    whiteSpace: "nowrap",
+                                  }}
+                                >
+                                  {host}
+                                </a>
+                              );
+                            })}
+                          </div>
+                        )}
+                        {m.role === "assistant" && m.content && (
+                          <div style={{ display: "flex", alignItems: "center", gap: "10px", marginTop: "8px" }}>
+                            {m.elapsedMs != null && (
+                              <span style={{ fontSize: "11px", color: TEXT_MUTED2, display: "flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
+                                <svg width="11" height="11" viewBox="0 0 14 14" fill="none">
+                                  <circle cx="7" cy="7" r="6" stroke={SUCCESS} strokeWidth="1.3" />
+                                  <path d="M4.3 7.2l1.8 1.8 3.6-4" stroke={SUCCESS} strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+                                </svg>
+                                Completed • {(m.elapsedMs / 1000).toFixed(1)}s
+                              </span>
+                            )}
+                            <div style={{ display: "flex", alignItems: "center", gap: "3px", marginLeft: m.elapsedMs != null ? "auto" : "0" }}>
+                              <button onClick={() => regenerateColumn(col)} title="Regenerate" style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_MUTED, padding: "3px", borderRadius: "6px", display: "flex" }}>
+                                <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+                                  <path d="M13.5 8a5.5 5.5 0 10-1.8 4.1" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" fill="none" />
+                                  <path d="M13.5 4.5v3.5H10" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+                                </svg>
+                              </button>
+                              <button onClick={() => copyMessage(m.content)} title="Copy" style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_MUTED, padding: "3px", borderRadius: "6px", display: "flex" }}>
+                                <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+                                  <rect x="5.5" y="5.5" width="8" height="8.5" rx="1.3" stroke="currentColor" strokeWidth="1.3" fill="none" />
+                                  <path d="M4 10.3H3a1 1 0 01-1-1V3a1 1 0 011-1h6.7a1 1 0 011 1v1.2" stroke="currentColor" strokeWidth="1.3" fill="none" />
+                                </svg>
+                              </button>
+                              <button
+                                onClick={() => speak(m.content, (msg) => setVoiceError(msg), true, voiceURI)}
+                                title="Read this reply aloud"
+                                style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_MUTED, padding: "3px", borderRadius: "6px", display: "flex" }}
+                              >
+                                <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+                                  <path d="M2 6.3h2.4L8 3.3v9.4L4.4 9.7H2z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" fill="none" />
+                                  <path d="M10.8 5.5a3.3 3.3 0 010 5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" fill="none" />
+                                </svg>
+                              </button>
+                              <button
+                                onClick={() => setMessageReaction(col.id, m.id, "up")}
+                                title="Good response"
+                                style={{ border: "none", background: "transparent", cursor: "pointer", color: m.reaction === "up" ? SUCCESS : TEXT_MUTED, padding: "3px", borderRadius: "6px", display: "flex" }}
+                              >
+                                <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+                                  <path
+                                    d="M5.5 6.5V13H3.8a.8.8 0 01-.8-.8V7.3a.8.8 0 01.8-.8h1.7zm0 0L8 2.5a1.3 1.3 0 012.4.9l-.6 3.1h3a1.3 1.3 0 011.2 1.8l-1.7 4a1.3 1.3 0 01-1.2.7H5.5"
+                                    stroke="currentColor"
+                                    strokeWidth="1.2"
+                                    strokeLinejoin="round"
+                                    fill="none"
+                                  />
+                                </svg>
+                              </button>
+                              <button
+                                onClick={() => setMessageReaction(col.id, m.id, "down")}
+                                title="Bad response"
+                                style={{ border: "none", background: "transparent", cursor: "pointer", color: m.reaction === "down" ? ERROR : TEXT_MUTED, padding: "3px", borderRadius: "6px", display: "flex" }}
+                              >
+                                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" transform="rotate(180 8 8)">
+                                  <path
+                                    d="M5.5 6.5V13H3.8a.8.8 0 01-.8-.8V7.3a.8.8 0 01.8-.8h1.7zm0 0L8 2.5a1.3 1.3 0 012.4.9l-.6 3.1h3a1.3 1.3 0 011.2 1.8l-1.7 4a1.3 1.3 0 01-1.2.7H5.5"
+                                    stroke="currentColor"
+                                    strokeWidth="1.2"
+                                    strokeLinejoin="round"
+                                    fill="none"
+                                  />
+                                </svg>
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+
+                  {loading[col.id] && (
+                    <div style={{ display: "flex", gap: "4px", paddingLeft: "29px" }}>
+                      <span className="tdot" style={{ width: "5px", height: "5px", borderRadius: "50%", background: providerDef.color, display: "inline-block" }} />
+                      <span className="tdot" style={{ width: "5px", height: "5px", borderRadius: "50%", background: providerDef.color, display: "inline-block" }} />
+                      <span className="tdot" style={{ width: "5px", height: "5px", borderRadius: "50%", background: providerDef.color, display: "inline-block" }} />
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div style={{ padding: "12px 20px 18px", flexShrink: 0 }}>
+          {attachments.length > 0 && (
+            <div style={{ display: "flex", gap: "6px", marginBottom: "8px", flexWrap: "wrap", maxWidth: "760px", margin: "0 auto 8px" }}>
+              {attachments.map((a) => (
+                <div key={a.id} style={{ display: "flex", alignItems: "center", gap: "6px", background: PANEL_BG_ALT, borderRadius: "8px", padding: "4px 8px", fontSize: "12px", border: BORDER }}>
+                  {a.kind === "image" && <img src={a.dataUrl} alt={a.name} style={{ width: "18px", height: "18px", objectFit: "cover", borderRadius: "4px" }} />}
+                  <span style={{ color: TEXT_SOFT }}>{a.name}</span>
+                  <button onClick={() => removeAttachment(a.id)} style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_MUTED }}>
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{ maxWidth: "760px", margin: "0 auto", display: "flex", alignItems: "flex-end", gap: "6px", border: BORDER, borderRadius: "20px", padding: "8px 8px 8px 16px", background: PANEL_BG, boxShadow: "0 6px 24px rgba(0,0,0,0.28)" }}>
+            <button onClick={() => fileInputRef.current && fileInputRef.current.click()} style={{ border: "none", background: "transparent", cursor: "pointer", color: TEXT_FAINT, flexShrink: 0, display: "flex", padding: "4px" }} aria-label="Attach file" title="Attach image or text file">
+              <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+                <path d="M11.5 3.5l-6 6a3 3 0 004.2 4.2l6-6a2 2 0 00-2.8-2.8l-5.7 5.7" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" fill="none" />
+              </svg>
+            </button>
+            <input ref={fileInputRef} type="file" multiple style={{ display: "none" }} onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }} />
+            <button
+              onClick={() => setWebSearchOn((v) => !v)}
+              style={{
+                border: "none",
+                background: webSearchOn ? "rgba(217,164,65,0.14)" : "transparent",
+                cursor: "pointer",
+                color: webSearchOn ? ACCENT : TEXT_FAINT,
+                flexShrink: 0,
+                display: "flex",
+                padding: "4px",
+                borderRadius: "8px",
+              }}
+              aria-label="Toggle web search"
+              title={webSearchOn ? "Web search on — used automatically wherever a model/provider supports it" : "Turn on web search (where supported)"}
+            >
+              <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+                <circle cx="9" cy="9" r="6.5" stroke="currentColor" strokeWidth="1.3" />
+                <ellipse cx="9" cy="9" rx="2.7" ry="6.5" stroke="currentColor" strokeWidth="1.1" />
+                <line x1="2.6" y1="9" x2="15.4" y2="9" stroke="currentColor" strokeWidth="1.1" />
+                <path d="M3.6 5.3c1.3.9 3.3 1.5 5.4 1.5s4.1-.6 5.4-1.5M3.6 12.7c1.3-.9 3.3-1.5 5.4-1.5s4.1.6 5.4 1.5" stroke="currentColor" strokeWidth="1" fill="none" />
+              </svg>
+            </button>
+            <button
+              onClick={toggleListening}
+              style={{
+                border: "none",
+                background: listening ? "rgba(226,124,124,0.14)" : "transparent",
+                cursor: "pointer",
+                color: listening ? ERROR : TEXT_FAINT,
+                flexShrink: 0,
+                display: "flex",
+                padding: "4px",
+                borderRadius: "8px",
+              }}
+              aria-label="Dictate a message"
+              title={listening ? "Listening — click to stop and send" : "Speak your message (auto-sends when you stop talking)"}
+            >
+              <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+                <rect x="7" y="2" width="4" height="8" rx="2" fill="currentColor" />
+                <path d="M4 8.5v1a5 5 0 0010 0v-1M9 14.5v2" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" fill="none" />
+              </svg>
+            </button>
+            <textarea
+              ref={textareaRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder={listening ? "Listening…" : "Message all active models..."}
+              rows={1}
+              style={{ flex: 1, resize: "none", background: "transparent", border: "none", color: TEXT_PRIMARY, fontFamily: "inherit", fontSize: "15px", lineHeight: 1.5, maxHeight: "160px", padding: "6px 0" }}
+            />
+            <button
+              className="send-btn"
+              onClick={() => handleSend()}
+              disabled={anyBusy || (!input.trim() && attachments.length === 0)}
+              style={{ width: "32px", height: "32px", borderRadius: "50%", border: "none", background: !anyBusy && (input.trim() || attachments.length) ? ACCENT : BORDER_COLOR, color: BG, cursor: !anyBusy && (input.trim() || attachments.length) ? "pointer" : "default", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" }}
+            >
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                <path d="M7 11V3M3 6.5L7 3l4 3.5" stroke={BG} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+              </svg>
+            </button>
+          </div>
+          {webSearchOn && (
+            <div style={{ textAlign: "center", fontSize: "11px", color: TEXT_MUTED2, marginTop: "9px" }}>
+              Web search is on — used automatically for Google, OpenRouter (any model), Groq's compound systems, and Groq's GPT-OSS models. Other providers here don't offer a request-level web search, so they'll answer from training data only.
+            </div>
+          )}
+          {columns.some((c) => c.imageMode) && (
+            <div style={{ textAlign: "center", fontSize: "11px", color: TEXT_MUTED2, marginTop: "9px" }}>
+              One or more columns is set to generate images — whatever you type is sent as the image prompt to those columns instead of a chat message.
+            </div>
+          )}
+        </div>
+      </div>
+
+      {showHistory && (
+        <Modal title="Previous chats" onClose={() => setShowHistory(false)}>
+          {historyList.length === 0 && <div style={{ fontSize: "13px", color: TEXT_MUTED, padding: "20px 4px" }}>No saved chats yet — conversations save here automatically as you go.</div>}
+          {historyList
+            .slice()
+            .sort((a, b) => b.updatedAt - a.updatedAt)
+            .map((entry) => (
+              <div
+                key={entry.id}
+                className={"dropdown-item" + (entry.id === sessionIdRef.current ? " dropdown-item--accent" : "")}
+                onClick={() => restoreHistoryEntry(entry)}
+                style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", padding: "10px 12px", borderRadius: "9px", cursor: "pointer", marginBottom: "4px", background: entry.id === sessionIdRef.current ? "rgba(217,164,65,0.1)" : "transparent" }}
+              >
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: "13.5px", color: TEXT_PRIMARY, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.title || "New conversation"}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px", marginTop: "3px" }}>
+                    <span style={{ fontSize: "11.5px", color: TEXT_MUTED }}>{formatRelativeTime(entry.updatedAt)}</span>
+                    <span style={{ fontSize: "11.5px", color: TEXT_FAINTEST }}>·</span>
+                    <span style={{ fontSize: "11.5px", color: TEXT_MUTED }}>
+                      {(entry.columns || []).map((c) => PROVIDER_DEFAULTS[c.provider] && PROVIDER_DEFAULTS[c.provider].label).filter(Boolean).join(", ")}
+                    </span>
+                  </div>
+                </div>
+                <button
+                  onClick={(e) => deleteHistoryEntry(entry.id, e)}
+                  title="Delete this chat"
+                  style={{ border: "none", background: "transparent", color: TEXT_MUTED, cursor: "pointer", fontSize: "14px", flexShrink: 0, padding: "4px" }}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+        </Modal>
+      )}
+
+      {showLiveVoice && <LiveVoiceModal apiKey={providers.google.apiKey} onClose={() => setShowLiveVoice(false)} />}
+
+      {voiceError && (
+        <div style={{ position: "fixed", bottom: "22px", left: "50%", transform: "translateX(-50%)", background: PANEL_BG_ALT, border: "1px solid #3A2C2C", color: ERROR, borderRadius: "9px", padding: "9px 16px", fontSize: "12.5px", boxShadow: "0 8px 24px rgba(0,0,0,0.4)", zIndex: 60 }}>
+          {voiceError}
+        </div>
+      )}
+
+      {showSettings && (
+        <Modal title="Provider settings" onClose={() => setShowSettings(false)} width="580px" maxHeight="85vh" padding="22px" headerMarginBottom="16px">
+          {providerKeys.map((key) => (
+            <div key={key} style={{ marginBottom: "16px", paddingBottom: "16px", borderBottom: DIVIDER }}>
+              <ProviderKeyCard
+                providerKey={key}
+                def={PROVIDER_DEFAULTS[key]}
+                savedKey={providers[key].apiKey}
+                onSave={(k, v) => updateProvider(k, "apiKey", v)}
+              />
+              <label style={{ ...FIELD_LABEL_STYLE, marginTop: "12px", display: "block" }}>Default model for new columns</label>
+              <div style={{ border: BORDER, background: BG, borderRadius: "8px", padding: "7px 11px", marginBottom: "9px", marginTop: "4px", display: "flex", alignItems: "center" }}>
+                <ModelPicker
+                  color={PROVIDER_DEFAULTS[key].color}
+                  model={providers[key].defaultModel}
+                  providerKey={key}
+                  cacheEntry={modelsCache[key]}
+                  onFetch={loadModels}
+                  onSelect={(id) => updateProvider(key, "defaultModel", id)}
+                />
+              </div>
+              <label style={FIELD_LABEL_STYLE}>Base URL</label>
+              <input
+                type="text"
+                value={providers[key].baseUrl}
+                onChange={(e) => updateProvider(key, "baseUrl", e.target.value)}
+                style={{ ...FIELD_INPUT_STYLE, marginBottom: "9px" }}
+              />
+              <label style={FIELD_LABEL_STYLE}>Max reply length cap (tokens)</label>
+              <input
+                type="number"
+                min="64"
+                max="32000"
+                value={providers[key].maxTokens}
+                onChange={(e) => updateProvider(key, "maxTokens", Math.max(64, Number(e.target.value) || 4096))}
+                style={FIELD_INPUT_STYLE}
+              />
+              <div style={{ fontSize: "11px", color: TEXT_MUTED, marginTop: "5px" }}>Just the upper limit — replies auto-size to the question. Lower this if a smaller model errors with "context length exceeded."</div>
+            </div>
+          ))}
+        </Modal>
+      )}
+
+      {authModalStep === "setup" && (
+        <Modal title="Connect Supabase" onClose={() => setAuthModalStep(null)}>
+          <SupabaseSetupForm
+            onSave={(cfg) => {
+              saveSupabaseCfg(cfg);
+              setAuthModalStep("signin");
+            }}
+          />
+        </Modal>
+      )}
+
+      {authModalStep === "signin" && supabaseClient && (
+        <Modal title="Sign in for Premium" onClose={() => setAuthModalStep(null)}>
+          <AuthForm
+            supabaseClient={supabaseClient}
+            onSuccess={() => setAuthModalStep("premium")}
+            onReconfigure={() => {
+              reconfigureSupabase();
+              setAuthModalStep("setup");
+            }}
+          />
+        </Modal>
+      )}
+
+      {authModalStep === "premium" && session && (
+        <Modal title="Upgrade to Premium" onClose={() => setAuthModalStep(null)}>
+          <PremiumForm session={session} client={supabaseClient} onDone={() => setAuthModalStep(null)} />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<Chatbot />);
+</script>
+</body>
+</html>
